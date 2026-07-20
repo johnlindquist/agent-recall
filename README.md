@@ -51,28 +51,13 @@ cd agent-recall
 
 The installer is transactional (preflight → isolated self-test → staged and
 validated artifacts → apply) and reversible (`./install.sh --uninstall`,
-which works even without Node). It:
-
-1. **Raises Claude Code transcript retention** (`cleanupPeriodDays: 36500`)
-   in both config homes, with one-time backups restored on uninstall if the
-   value is still ours. (Codex already retains transcripts by default and is
-   deliberately not modified.) The scheduled archive — not any vendor
-   setting — is the real safeguard.
-2. Creates the private store at `~/Library/Application Support/AgentRecall/`
-   (mode `700`, `umask 077` throughout; Spotlight exclusion marker; Time
-   Machine exclusion *attempted*, warned about if it fails).
-3. Installs the `recall` CLI to `~/.local/bin` and a launchd job that runs a
-   watchdog-bounded one-shot sync every 30 minutes while you're logged in
-   (missed intervals are not queued). No daemon, no network listener, no
-   telemetry. Wrappers pass Node a sanitized environment (no `NODE_OPTIONS`,
-   `RIPGREP_CONFIG_PATH`, or `DYLD_*` passthrough).
-4. Adds a managed instruction block + skill so your agents are *asked* to
-   search history when you reference past work and to propose (never write)
-   memory — this is behavioral guidance for the agents, not an enforcement
-   boundary; the one hard gate is that `recall remember` refuses
-   non-interactive callers.
-5. Runs an isolated self-test and a first full sync (bounded; large corpora
-   index over multiple passes).
+which works even without Node). It raises Claude Code transcript retention
+(with one-time backups), creates the private store at
+`~/Library/Application Support/AgentRecall/` (mode `700`, `umask 077`,
+Spotlight-excluded, Time Machine exclusion attempted and warned about),
+installs the `recall` CLI plus a watchdog-bounded launchd one-shot every 30
+minutes, and adds a managed instruction block + skill so your agents are
+*asked* to search history and to propose (never write) memory.
 
 ## Commands
 
@@ -88,55 +73,180 @@ recall agy-enable                enable the Antigravity snapshot lane (runs a WA
 recall index [--rebuild] | archive | self-test
 ```
 
-## Design principles
+## Why it's built this way
 
-Distilled from a research pass across the memory/search-tool ecosystem's
-issue trackers, then validated by adversarial review (the failure modes
-below are documented incidents in other tools):
+This tool was designed backwards from failure evidence: a mining pass over
+the issue trackers of 25+ agent-memory and session-search tools and the
+native CLI trackers (mid-2026), followed by an adversarial multi-model
+review whose findings were fixed before publication. Every load-bearing
+decision below links to the incidents that motivated it.
 
-- **Archive before parse.** Transcripts are copied byte-for-byte (with
-  crash-consistent, fsync'd, no-clobber commit protocols) into an
-  append-preserving archive; parsing happens only on archived copies.
-  Source deletion never propagates. Rewrites create new immutable
-  generations, verified by full prefix comparison — never a sampled hash.
-- **The index is disposable.** SQLite FTS5 is a projection; parser upgrades
-  rebuild it automatically from the archive. `recall search --raw` (ripgrep,
-  `--no-config`, sanitized env) works with no index at all.
-- **Coverage is honest and persistent.** Every search prints per-source
-  freshness and a permanent gap ledger (`index_gaps`) that survives no-op
-  runs. A source with archived files but zero indexed events is loudly
-  UNCOVERED. A degraded empty result never claims "no history exists."
-- **Curation over capture.** Nothing enters memory automatically. Agents
-  propose plain-text candidates; only a human at an interactive terminal can
-  run `recall remember`. Facts age (staleness flags), retract without
-  deletion, and are read as pointers to verify — not authority.
-- **Recalled content is inert.** Output is sanitized against terminal-escape
-  and spoofing tricks, likely credentials/PII are redacted on display (best
-  effort — scanning is never complete), session ids are allowlist-validated
-  before any resume command is printed, and agents are instructed to treat
-  everything recalled as data, never instructions.
-- **Local only. No daemons.** No network APIs anywhere in the codebase; a
-  bounded launchd one-shot with owner-token locks (concurrent runs exit 75,
-  they don't corrupt or lie). Note: agent-recall itself opens no sockets,
-  but any *agent* that reads recall output may transmit it to its own model
-  provider — that's the nature of using cloud agents.
+### Fix retention first, then archive independently
+
+Claude Code deletes transcripts after 30 days by default, keyed on file
+*mtime* — so backup restores and sync tools can make live sessions look old,
+and users have reported losing years of work with no warning or recovery
+([anthropics/claude-code#59248](https://github.com/anthropics/claude-code/issues/59248));
+setting the knob to `0` has been reported to mean "delete everything," not
+"off" ([#23710](https://github.com/anthropics/claude-code/issues/23710)).
+Codex fails in the opposite direction — no retention control at all
+([openai/codex#6015](https://github.com/openai/codex/issues/6015)). So the
+installer raises Claude's retention as defense-in-depth, but the scheduled
+append-preserving archive — outside every vendor's deletion policy — is the
+actual guarantee. Vendors have also declined to bridge history even between
+their *own* surfaces
+([codex#4268](https://github.com/openai/codex/issues/4268),
+[claude-code#2511](https://github.com/anthropics/claude-code/issues/2511)),
+which is why a neutral local archive exists at all.
+
+### Watch files; never hook the agent runtime
+
+Every tool that integrates via lifecycle hooks accumulates "capture
+silently stopped after the host updated" issues — claude-mem's OpenCode
+plugin loading but capturing nothing
+([thedotmack/claude-mem#2832](https://github.com/thedotmack/claude-mem/issues/2832))
+is one of a genre. The maintainer of basic-memory reached the same
+conclusion designing a transcript-watching sidecar: runtime injection is
+"fragile, vendor-specific, opaque"
+([basicmachines-co/basic-memory#669](https://github.com/basicmachines-co/basic-memory/issues/669)).
+agent-recall reads transcript files and touches nothing else.
+
+### Archive before parse; tolerate schema drift
+
+Session formats are explicitly unstable: one Claude-Code-only viewer
+maintains a rolling series of per-release compatibility issues
+([delexw/claude-code-trace](https://github.com/delexw/claude-code-trace/issues?q=compat)),
+another accumulated 10+ recurring schema-validation crashes
+([d-kimuson/claude-code-viewer#161](https://github.com/d-kimuson/claude-code-viewer/issues/161)),
+and cass broke repeatedly on OpenCode storage migrations
+([Dicklesworthstone/coding_agent_session_search#227](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/227)).
+So parsing here is skip-and-continue over *archived copies* — a parser
+failure can never lose data, only leave a counted gap — and a parser-version
+bump automatically rebuilds the whole index from the archive.
+
+### The index is disposable; resources are bounded; no daemons
+
+The scale failures in this space are spectacular: 410 GB of orphaned staging
+files overnight
+([cass#324](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/324)),
+24–36 GB RSS on large corpora
+([cass#326](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/326)),
+a sync that hangs at ~500 sessions across five releases
+([specstoryai/getspecstory#180](https://github.com/specstoryai/getspecstory/issues/180)),
+120 GB of checkpoints with no GC
+([cline/cline#3790](https://github.com/cline/cline/issues/3790)), and
+background workers leaking hundreds of orphan processes
+([claude-mem#3301](https://github.com/thedotmack/claude-mem/issues/3301)).
+Hence: streaming line scanner with hard per-line caps, time-budgeted runs
+that checkpoint mid-file, owner-token locks where a busy competitor exits 75
+instead of corrupting or lying, one launchd one-shot with a watchdog instead
+of any resident daemon — and an index you can delete at any time, because
+the archive is canonical.
+
+### Coverage is honest, per-source, and permanent
+
+The most common bug shape across every memory tool we studied is *silent
+failure*: writes that report success and store nothing
+([supermemoryai/supermemory#792](https://github.com/supermemoryai/supermemory/issues/792)),
+resets that delete nothing
+([mem0ai/mem0#6411](https://github.com/mem0ai/mem0/issues/6411)), and search
+that quietly indexed only tool *names*, not contents
+([jhlee0409/claude-code-history-viewer#429](https://github.com/jhlee0409/claude-code-history-viewer/issues/429)).
+This project hit its own version during development — an early generic
+parser produced **zero** indexed events for 4,630 archived Codex files while
+an aggregate "unparsed lines" counter hid it. The response is structural:
+per-source coverage in every search and doctor run ("discovered is not
+covered"), a persistent `index_gaps` ledger that survives no-op runs, and a
+hard output rule — a degraded empty result must say so, never "no history."
+
+### Memory is curated, human-gated, and append-only
+
+The landmark audit here is mem0's production deployment where **97.8% of
+10,134 auto-extracted memories were junk** — boot-context re-extracted every
+session, plus a 668-copy feedback loop from re-extracting recalled content
+([mem0ai/mem0#4573](https://github.com/mem0ai/mem0/issues/4573)). LLM-managed
+memory files have also been observed destroying their own history by
+overwriting instead of appending
+([GreatScottyMac/roo-code-memory-bank#21](https://github.com/GreatScottyMac/roo-code-memory-bank/issues/21)),
+and every mainline agent asked to build Memory Bank in declined, calling any
+memory schema too opinionated for a general tool
+([RooCodeInc/Roo-Code#3312](https://github.com/RooCodeInc/Roo-Code/issues/3312)).
+So here: nothing persists automatically; agents propose plain-text
+candidates; `recall remember` refuses non-interactive callers (a
+prompt-injected agent cannot write memory); facts retract without deletion,
+age with staleness flags, and are read as pointers to verify against
+reality — because shipped auto-memory's top complaint quickly becomes "the
+model ignores it or trusts it stale"
+([google-gemini/gemini-cli#13852](https://github.com/google-gemini/gemini-cli/issues/13852)).
+
+### Recalled content is treated as hostile input
+
+Transcripts contain secrets and attacker-influenced text (web pages, tool
+output, cloned repos). Real incidents in adjacent tools include session
+capture leaking secrets into public git branches
+([entireio/cli#340](https://github.com/entireio/cli/issues/340)), redaction
+that misses low-entropy keys
+([entireio/cli#1716](https://github.com/entireio/cli/issues/1716)), history
+files not gitignored (filed as a security issue,
+[getspecstory#224](https://github.com/specstoryai/getspecstory/issues/224)),
+and a popular memory plugin exposing all captured sessions on an
+unauthenticated local port
+([claude-mem#1251](https://github.com/thedotmack/claude-mem/issues/1251)).
+Our own adversarial review added reproduced findings: session filenames as
+shell-injection vectors in printed resume commands, and ripgrep executing an
+arbitrary preprocessor via an inherited `RIPGREP_CONFIG_PATH`. Hence:
+best-effort credential/PII redaction on all display paths, terminal-escape
+and spoofing sanitization, allowlist-validated session ids before any
+command is printed, `rg --no-config` with a sanitized environment, no
+network APIs anywhere, and instruction text that frames every recalled byte
+as inert data. (Honest boundary: agent-recall opens no sockets, but any
+cloud agent that reads its output transmits it; and same-UID malware is out
+of scope — FileVault plus `0700` is the line.)
+
+### Lexical search first; embeddings behind an evidence gate
+
+Practitioners in this niche keep converging on the same verdict: for coding
+recall — exact errors, identifiers, paths — BM25-style lexical search wins,
+and vector pipelines get abandoned (see the "versioned folders of markdown"
+sentiment and the no-database design of
+[sinzin91/search-sessions](https://github.com/sinzin91/search-sessions);
+fast-resume's author chose typo-tolerant lexical over embeddings
+deliberately). The one tool in this space that shipped semantic search
+concentrates its worst stability failures there
+([cass#347](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/347)).
+An embedding index is also one more PII derivative every purge must
+enumerate. So: FTS5 with structural ranking (user messages and session
+openers weighted above tool noise, per the field evidence that recency- and
+role-blind injection performs worst,
+[claude-mem#1573](https://github.com/thedotmack/claude-mem/issues/1573)),
+and semantic search only when real usage shows paraphrase queries failing
+lexical ones — a measured gate, not a fashion choice. The disposable index
+makes reversing this decision a version bump, not a migration.
+
+### Antigravity gets its own gated lane
+
+Antigravity stores one *live* SQLite database per conversation with WAL
+sidecars. Naively copying `.db` files loses committed transactions sitting
+in the WAL and risks corrupt snapshots, so this lane uses the SQLite Online
+Backup API from a read-only connection, integrity-checks the snapshot (never
+the source), content-hash dedupes generations — and ships disabled until a
+synthetic WAL canary proves all of that on your machine (`recall
+agy-enable`).
 
 ## Known limitations (deliberate)
 
-- Lexical search only (FTS5 + ripgrep); no embeddings.
-- Not everything indexes: pretty-printed JSON, unknown schemas, and
-  oversized lines become counted, permanent gaps covered by `--raw`.
+- Lexical only; no embeddings (see gate above).
+- Pretty-printed JSON, unknown schemas, and oversized lines become counted
+  permanent gaps covered by `--raw` — not silently dropped, not indexed.
 - The archive is **preservation against vendor deletion, not a backup** —
-  it lives on the same disk, and capture is periodic (a session created and
-  deleted between syncs can be missed; a budget-capped run reports itself
-  as incomplete). Pair with FileVault and your own encrypted backups.
-- Same-UID processes can read the store; there is no app-level encryption.
-  Grok/Kimi resume syntax is unverified and labeled as such. Search hit
-  state (`show <n>`) is a single shared file — concurrent searches from
-  multiple terminals can race it.
-- macOS only (launchd). See `PURGE.md` for honest removal semantics
-  (including what deletion *cannot* purge: snapshots, backups, SSD
-  remnants, vendor copies).
+  same disk, periodic capture (a session created and deleted between syncs
+  can be missed). Pair with FileVault and your own encrypted backups.
+- Same-UID processes can read the store; no app-level encryption. Grok/Kimi
+  resume syntax is unverified and labeled as such. `show <n>` state is a
+  single shared file — concurrent searches from multiple terminals can race.
+- macOS only (launchd). See `PURGE.md` for honest removal semantics,
+  including what deletion *cannot* purge (snapshots, backups, SSD remnants,
+  vendor copies).
 
 ## Uninstall
 
