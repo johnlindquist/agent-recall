@@ -3,6 +3,7 @@
 // lib/parsers.mjs existing. Tests run serially and share one archive/db.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -36,6 +37,8 @@ function writeGen(source, key, rel, gen, content) {
   fs.writeFileSync(fp, content);
   return fp;
 }
+
+const fileSha = (fp) => crypto.createHash("sha256").update(fs.readFileSync(fp)).digest("hex");
 
 const db = dbOpen();
 const idx = (opts = {}) => indexAll(db, { parsers, ...opts });
@@ -228,6 +231,36 @@ test(".partial and non-final generation names never index", async () => {
   assert.equal(count("SELECT count(*) c FROM events WHERE text='partial canary'"), 1);
 });
 
+test("plain-text log generations remain raw-only without JSON parse gaps", async () => {
+  const fixtures = [
+    writeGen("grok", "rawlog-grok", "encoded-project/session/terminal/call-0001.log", "g0001.log", [
+      "plain terminal output",
+      ev("user", "message", "valid-json-looking-terminal-output"),
+      "{not valid json",
+    ].join("\n") + "\n"),
+    writeGen("kimi-code", "rawlog-kimi-main", "wd_project/session/logs/kimi-code.log", "g0001.log", [
+      "2026-07-22T10:00:00Z diagnostic line",
+      "debug: request completed",
+    ].join("\n") + "\n"),
+    writeGen("kimi-code", "rawlog-kimi-output", "wd_project/session/agents/main/tasks/bash-1/output.log", "g0001.log", [
+      "command output",
+      "exit status 0",
+    ].join("\n") + "\n"),
+  ];
+  const beforeHashes = new Map(fixtures.map((fp) => [fp, fileSha(fp)]));
+  const before = gapCount(db);
+  const s = await idx();
+  assert.equal(s.files, 0);
+  assert.equal(s.parseErrors, 0);
+  assert.equal(gapCount(db), before);
+  for (const fp of fixtures) {
+    assert.equal(count("SELECT count(*) c FROM files WHERE path=?", fp), 0, fp);
+    assert.equal(count("SELECT count(*) c FROM events WHERE path=?", fp), 0, fp);
+    assert.equal(count("SELECT count(*) c FROM index_gaps WHERE path=?", fp), 0, fp);
+    assert.equal(fileSha(fp), beforeHashes.get(fp), `raw-only artifact changed: ${fp}`);
+  }
+});
+
 test("numeric gen sort; finalized gen tail parsed, newest gen tail stays pending", async () => {
   const d = path.join(ARCHIVE, "srcB", "ffff");
   writeGen("srcB", "ffff", "wiredir/tails.jsonl", "g9999.jsonl",
@@ -262,13 +295,40 @@ test("oversized line is dropped with bounded carry; neighbors index at right lin
   assert.ok(s.truncated >= 1);
   assert.equal(db.prepare("SELECT line FROM events WHERE text='before-big'").get().line, 1);
   assert.equal(db.prepare("SELECT line FROM events WHERE text='after-big'").get().line, 3);
-  const g = db.prepare("SELECT * FROM index_gaps WHERE kind='oversized-line'").get();
-  assert.equal(g.line, 2);
   const fp = path.join(ARCHIVE, "srcB", "gggg", "g0001.jsonl");
+  const g = db.prepare("SELECT * FROM index_gaps WHERE path=? AND kind='oversized-line'").get(fp);
+  assert.equal(g.line, 2);
   const f = db.prepare("SELECT size, offset, line FROM files WHERE path=?").get(fp);
   assert.equal(f.offset, f.size); // oversized line consumed past its newline
   assert.equal(f.line, 3);
   db.prepare("DELETE FROM index_gaps WHERE kind='oversized-line'").run(); // keep later summaries simple
+});
+
+test("oversized Codex compacted envelopes are ignored without false gaps", async () => {
+  const compacted = JSON.stringify({
+    timestamp: "2026-07-22T10:00:00.000Z",
+    type: "compacted",
+    payload: { message: "", replacement_history: ["x".repeat(17 * 1024 * 1024)], window_number: 1 },
+  });
+  const body = [
+    ev("user", "message", "before-compacted"),
+    compacted,
+    ev("assistant", "message", "after-compacted"),
+  ].join("\n") + "\n";
+  const fp = writeGen("codex-active", "compact", "2026/07/22/rollout-compacted.jsonl", "g0001.jsonl", body);
+  const before = gapCount(db);
+  const s = await idx();
+  assert.equal(s.files, 1);
+  assert.equal(s.events, 2);
+  assert.equal(s.parseErrors, 0);
+  assert.equal(s.truncated, 0);
+  assert.equal(gapCount(db), before);
+  assert.equal(count("SELECT count(*) c FROM index_gaps WHERE path=?", fp), 0);
+  assert.equal(count("SELECT count(*) c FROM events WHERE path=?", fp), 2);
+  assert.equal(db.prepare("SELECT line FROM events WHERE text='before-compacted'").get().line, 1);
+  assert.equal(db.prepare("SELECT line FROM events WHERE text='after-compacted'").get().line, 3);
+  const f = db.prepare("SELECT size,offset,line FROM files WHERE path=?").get(fp);
+  assert.deepEqual({ ...f }, { size: Buffer.byteLength(body), offset: Buffer.byteLength(body), line: 3 });
 });
 
 test("budget deadline honored INSIDE one huge file via mid-file checkpoint commit", async () => {
