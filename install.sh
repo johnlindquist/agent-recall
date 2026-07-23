@@ -104,7 +104,8 @@ PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 MANAGED_MARK="# agent-recall-managed"
 MARK_BEGIN='<!-- BEGIN agent-recall -->'
 MARK_END='<!-- END agent-recall -->'
-SKILL_TARGET="$ROOT/integration/agent-recall"
+SKILL_NAMES=("agent-recall" "agent-recall-save")
+SKILL_TARGETS=("$ROOT/integration/agent-recall" "$ROOT/integration/agent-recall-save")
 
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 KIMI_DIR="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
@@ -203,20 +204,46 @@ restore_retention() { # $1=name $2=settings.json — only if the current value i
 }
 
 # ---------- skill links (never clobber foreign targets) ----------
-install_skill_link() { # $1=skills dir
-  local link="$1/agent-recall"
+preflight_skill_link() { # $1=skills dir $2=name $3=managed target
+  local link="$1/$2" target="$3"
   if [ -L "$link" ]; then
-    if [ "$(readlink "$link")" = "$SKILL_TARGET" ]; then return 0; fi   # already ours
-    if [ ! -e "$link" ]; then ln -sfn "$SKILL_TARGET" "$link"; return 0; fi  # dead symlink
+    if [ "$(readlink "$link")" = "$target" ]; then return 0; fi
     die "refusing to replace $link (symlink to $(readlink "$link"), not ours)"
   fi
   if [ -e "$link" ]; then die "refusing to replace $link (existing non-symlink)"; fi
-  ln -s "$SKILL_TARGET" "$link"
 }
 
-remove_skill_link() { # $1=skills dir — only remove links that point at us
-  local link="$1/agent-recall"
-  if [ -L "$link" ] && [ "$(readlink "$link")" = "$SKILL_TARGET" ]; then rm -f "$link"; fi
+preflight_all_skill_links() {
+  local d i
+  for d in "${SKILL_DIRS[@]}"; do
+    i=0
+    while [ "$i" -lt "${#SKILL_NAMES[@]}" ]; do
+      preflight_skill_link "$d" "${SKILL_NAMES[$i]}" "${SKILL_TARGETS[$i]}"
+      i=$((i + 1))
+    done
+  done
+}
+
+install_skill_link() { # $1=skills dir $2=name $3=managed target
+  local link="$1/$2" target="$3"
+  preflight_skill_link "$1" "$2" "$target"
+  if [ ! -L "$link" ]; then ln -s "$target" "$link"; fi
+}
+
+remove_skill_link() { # $1=skills dir $2=name $3=target — remove only ours
+  local link="$1/$2" target="$3"
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then rm -f "$link"; fi
+}
+
+remove_all_skill_links() {
+  local d i
+  for d in "${SKILL_DIRS[@]}"; do
+    i=0
+    while [ "$i" -lt "${#SKILL_NAMES[@]}" ]; do
+      remove_skill_link "$d" "${SKILL_NAMES[$i]}" "${SKILL_TARGETS[$i]}"
+      i=$((i + 1))
+    done
+  done
 }
 
 xml_escape() {
@@ -244,9 +271,9 @@ do_uninstall() {
       echo "WARN: $WRAPPER lacks the '$MANAGED_MARK' marker — leaving it"
     fi
   fi
-  local f d
+  local f
   for f in "${ALL_AGENT_FILES[@]}"; do remove_block "$f"; done
-  for d in "${SKILL_DIRS[@]}"; do remove_skill_link "$d"; done
+  remove_all_skill_links
   restore_retention claude-primary "$HOME/.claude/settings.json"
   restore_retention claude-second "$HOME/.claude-second/settings.json"
   rm -f "$ROOT_POINTER"
@@ -258,6 +285,7 @@ if [ "$UNINSTALL" = true ]; then do_uninstall; fi
 # ---------- 1. preflight (no mutation) ----------
 STAGE_NAME="preflight"
 echo "== agent-recall install =="
+if [ "$HUMAN_ONLY" = false ]; then preflight_all_skill_links; fi
 NODE_BIN="$(command -v node 2>/dev/null || true)"
 if [ -z "$NODE_BIN" ]; then
   die "node not found on PATH — install Node.js >= 22.5 (e.g. brew install node) or fix PATH"
@@ -291,12 +319,43 @@ env NODE_NO_WARNINGS=1 "$NODE_BIN" "$REPO/bin/recall.mjs" self-test
 # ---------- 3. stage everything in mktemp and validate ----------
 mark_stage "staging"
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-recall-install.XXXXXX")"
-mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/lib"
+mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/lib" \
+  "$STAGE_DIR/integration/agent-recall" \
+  "$STAGE_DIR/integration/agent-recall-save/agents"
 cp "$REPO/bin/archive.mjs" "$REPO/bin/recall.mjs" "$STAGE_DIR/bin/"
 cp "$REPO/lib/"*.mjs "$STAGE_DIR/lib/"
 for m in "$STAGE_DIR"/bin/*.mjs "$STAGE_DIR"/lib/*.mjs; do
   "$NODE_BIN" --check "$m"
 done
+
+stage_skill_file() { # $1=source $2=destination $3=expected name
+  local src="$1" dest="$2" expected="$3"
+  if [ ! -f "$src" ] || [ -L "$src" ]; then
+    die "skill source is missing, nonregular, or symlinked: $src"
+  fi
+  if ! grep -qx "name: $expected" "$src"; then
+    die "skill source frontmatter name does not match $expected: $src"
+  fi
+  cp "$src" "$dest"
+  chmod 600 "$dest"
+  cmp -s "$src" "$dest" || die "staged skill bytes differ: $expected"
+}
+stage_skill_file \
+  "$REPO/integration/SKILL.md" \
+  "$STAGE_DIR/integration/agent-recall/SKILL.md" \
+  "agent-recall"
+stage_skill_file \
+  "$REPO/integration/agent-recall-save/SKILL.md" \
+  "$STAGE_DIR/integration/agent-recall-save/SKILL.md" \
+  "agent-recall-save"
+SAVE_OPENAI="$REPO/integration/agent-recall-save/agents/openai.yaml"
+if [ ! -f "$SAVE_OPENAI" ] || [ -L "$SAVE_OPENAI" ]; then
+  die "save skill UI metadata is missing, nonregular, or symlinked: $SAVE_OPENAI"
+fi
+cp "$SAVE_OPENAI" "$STAGE_DIR/integration/agent-recall-save/agents/openai.yaml"
+chmod 600 "$STAGE_DIR/integration/agent-recall-save/agents/openai.yaml"
+cmp -s "$SAVE_OPENAI" "$STAGE_DIR/integration/agent-recall-save/agents/openai.yaml" ||
+  die "staged save skill UI metadata bytes differ"
 
 ROOT_Q="$(printf '%q' "$ROOT")"
 BIN_Q="$(printf '%q' "$BIN")"
@@ -416,7 +475,7 @@ PLIST
 bash -n "$STAGE_DIR/recall"
 bash -n "$STAGE_DIR/run-sync.sh"
 plutil -lint "$STAGE_DIR/$LABEL.plist" >/dev/null
-echo "staged + validated: bin/lib modules, wrapper, run-sync.sh, plist"
+echo "staged + validated: bin/lib modules, both skills, wrapper, run-sync.sh, plist"
 
 # ---------- 4. bootout existing job (only if loaded) ----------
 mark_stage "bootout"
@@ -429,8 +488,11 @@ fi
 # ---------- 5. apply ----------
 mark_stage "apply"
 mkdir -p "$BIN" "$STATE" "$BACKUPS" "$ROOT/archive" "$ROOT/logs" "$ROOT/lib" \
-  "$ROOT/memory/global/facts" "$ROOT/memory/projects" "$ROOT/integration/agent-recall"
+  "$ROOT/memory/global/facts" "$ROOT/memory/projects" \
+  "$ROOT/integration/agent-recall" "$ROOT/integration/agent-recall-save/agents"
 chmod 700 "$ROOT" "$BIN" "$STATE" "$ROOT/archive" "$ROOT/logs" "$ROOT/lib" "$ROOT/memory" "$ROOT/integration"
+chmod 700 "$ROOT/integration/agent-recall" "$ROOT/integration/agent-recall-save" \
+  "$ROOT/integration/agent-recall-save/agents"
 touch "$ROOT/.metadata_never_index"
 if ! tm_err="$(tmutil addexclusion "$ROOT" 2>&1)"; then
   echo "WARN: tmutil addexclusion failed: $tm_err"
@@ -481,9 +543,24 @@ chmod 755 "$wtmp"
 mv -f "$wtmp" "$WRAPPER"
 echo "wrapper: $WRAPPER"
 
-# agent integration payload (single canonical copy under integration/agent-recall)
-cp "$REPO/integration/SKILL.md" "$ROOT/integration/agent-recall/SKILL.md"
-chmod 600 "$ROOT/integration/agent-recall/SKILL.md"
+# Agent integration payloads: install only from the validated staging tree.
+install_canonical_file() { # $1=staged file $2=canonical destination
+  local src="$1" dest="$2" tmp
+  tmp="$(mktemp "$(dirname "$dest")/.agent-recall.XXXXXX")"
+  cat "$src" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$dest"
+  cmp -s "$src" "$dest" || die "installed canonical bytes differ: $dest"
+}
+install_canonical_file \
+  "$STAGE_DIR/integration/agent-recall/SKILL.md" \
+  "$ROOT/integration/agent-recall/SKILL.md"
+install_canonical_file \
+  "$STAGE_DIR/integration/agent-recall-save/SKILL.md" \
+  "$ROOT/integration/agent-recall-save/SKILL.md"
+install_canonical_file \
+  "$STAGE_DIR/integration/agent-recall-save/agents/openai.yaml" \
+  "$ROOT/integration/agent-recall-save/agents/openai.yaml"
 rm -f "$ROOT/integration/SKILL.md"   # legacy unused top-level copy
 
 if [ "$HUMAN_ONLY" = false ]; then
@@ -501,12 +578,16 @@ if [ "$HUMAN_ONLY" = false ]; then
     else
       continue
     fi
-    install_skill_link "$d"
-    echo "skill: $d/agent-recall"
+    i=0
+    while [ "$i" -lt "${#SKILL_NAMES[@]}" ]; do
+      install_skill_link "$d" "${SKILL_NAMES[$i]}" "${SKILL_TARGETS[$i]}"
+      echo "skill: $d/${SKILL_NAMES[$i]}"
+      i=$((i + 1))
+    done
   done
 else
   for f in "${ALL_AGENT_FILES[@]}"; do remove_block "$f"; done
-  for d in "${SKILL_DIRS[@]}"; do remove_skill_link "$d"; done
+  remove_all_skill_links
   echo "human-only mode: no agent instructions installed"
 fi
 

@@ -7,6 +7,9 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL="$REPO/install.sh"
 BLOCK="$REPO/integration/agents-block.md"
+BASE_SKILL="$REPO/integration/SKILL.md"
+SAVE_SKILL="$REPO/integration/agent-recall-save/SKILL.md"
+SAVE_OPENAI="$REPO/integration/agent-recall-save/agents/openai.yaml"
 
 TESTROOT="$(mktemp -d "${TMPDIR:-/tmp}/recall-install-test.XXXXXX")"
 trap 'rm -rf "$TESTROOT"' EXIT
@@ -144,11 +147,22 @@ if grep -q 'save-all' "$h/.codex/config.toml"; then bad "codex config never gets
 check "no codex backup minted" test ! -e "$R/state/install-backups/codex-config.toml"
 
 check "claude skill link" test "$(readlink "$h/.claude/skills/agent-recall")" = "$R/integration/agent-recall"
+check "claude save skill link" test "$(readlink "$h/.claude/skills/agent-recall-save")" = "$R/integration/agent-recall-save"
+check "claude-second save skill link" test "$(readlink "$h/.claude-second/skills/agent-recall-save")" = "$R/integration/agent-recall-save"
 check "~/.agents/skills always created" test -d "$h/.agents/skills"
 check "agents skill link" test "$(readlink "$h/.agents/skills/agent-recall")" = "$R/integration/agent-recall"
+check "agents save skill link" test "$(readlink "$h/.agents/skills/agent-recall-save")" = "$R/integration/agent-recall-save"
+check "save link does not point at checkout" test "$(readlink "$h/.agents/skills/agent-recall-save")" != "$REPO/integration/agent-recall-save"
 check "no kimi link (no ~/.kimi-code)" test ! -e "$h/.kimi-code"
-check "SKILL.md canonical copy" test -f "$R/integration/agent-recall/SKILL.md"
+check "base SKILL.md canonical bytes" cmp -s "$BASE_SKILL" "$R/integration/agent-recall/SKILL.md"
+check "save SKILL.md canonical bytes" cmp -s "$SAVE_SKILL" "$R/integration/agent-recall-save/SKILL.md"
+check "save openai.yaml canonical bytes" cmp -s "$SAVE_OPENAI" "$R/integration/agent-recall-save/agents/openai.yaml"
+check "save canonical directory is 0700" test "$(stat -f %Lp "$R/integration/agent-recall-save")" = "700"
+check "save canonical SKILL.md is 0600" test "$(stat -f %Lp "$R/integration/agent-recall-save/SKILL.md")" = "600"
+check "save metadata directory is 0700" test "$(stat -f %Lp "$R/integration/agent-recall-save/agents")" = "700"
+check "save metadata file is 0600" test "$(stat -f %Lp "$R/integration/agent-recall-save/agents/openai.yaml")" = "600"
 check "no legacy top-level SKILL.md" test ! -e "$R/integration/SKILL.md"
+save_hash_before="$(shasum -a 256 "$R/integration/agent-recall-save/SKILL.md" | awk '{print $1}')"
 
 echo "# run-sync behavior (real bash, stub node)"
 printf '#!/bin/bash\nexit 75\n' > "$MOCK/node75"; chmod 755 "$MOCK/node75"
@@ -167,12 +181,32 @@ run_i "$h" > "$h/install2.log" 2>&1; rc=$?
 check "second install exits 0" test "$rc" -eq 0
 check "CLAUDE.md unchanged after rerun (no blank accumulation)" cmp -s "$h/.claude/CLAUDE.md" "$TESTROOT/expected-claude.md"
 check "backup still original value after rerun" jq -e '.had == true and .value == 7' "$R/state/install-backups/claude-primary.json"
+check "save canonical bytes unchanged after rerun" test "$(shasum -a 256 "$R/integration/agent-recall-save/SKILL.md" | awk '{print $1}')" = "$save_hash_before"
+check "save link unchanged after rerun" test "$(readlink "$h/.agents/skills/agent-recall-save")" = "$R/integration/agent-recall-save"
+
+echo "# canonical skill refresh"
+fixture="$TESTROOT/repo-fixture"
+mkdir -p "$fixture"
+cp "$REPO/install.sh" "$fixture/install.sh"
+cp -R "$REPO/bin" "$REPO/lib" "$REPO/integration" "$fixture/"
+printf '\n<!-- installer refresh fixture -->\n' >> "$fixture/integration/agent-recall-save/SKILL.md"
+real_install="$INSTALL"
+INSTALL="$fixture/install.sh"
+run_i "$h" > "$h/install-fixture.log" 2>&1; rc=$?
+check "fixture refresh install exits 0" test "$rc" -eq 0
+check "fixture refresh updates canonical bytes" cmp -s "$fixture/integration/agent-recall-save/SKILL.md" "$R/integration/agent-recall-save/SKILL.md"
+check "fixture refresh keeps managed link" test "$(readlink "$h/.agents/skills/agent-recall-save")" = "$R/integration/agent-recall-save"
+INSTALL="$real_install"
+run_i "$h" > "$h/install-restore.log" 2>&1; rc=$?
+check "source restore install exits 0" test "$rc" -eq 0
+check "source restore returns canonical bytes" cmp -s "$SAVE_SKILL" "$R/integration/agent-recall-save/SKILL.md"
 
 echo "# human-only"
 run_i "$h" --human-only > "$h/install3.log" 2>&1; rc=$?
 check "human-only exits 0" test "$rc" -eq 0
 check "human-only removed block" cmp -s "$h/.claude/CLAUDE.md" "$TESTROOT/seed-claude.md"
 check "human-only removed skill link" test ! -e "$h/.claude/skills/agent-recall"
+check "human-only removed save skill link" test ! -e "$h/.claude/skills/agent-recall-save"
 check "human-only keeps wrapper" test -x "$W"
 
 echo "# uninstall (no RECALL_HOME env, no node on PATH, job loaded)"
@@ -185,6 +219,7 @@ check "uninstall removed plist" test ! -e "$P"
 check "uninstall booted out loaded job" grep -q "launchctl bootout gui/$(id -u)/local.agent-recall.sync" "$h/mock.log"
 check "uninstall removed block" cmp -s "$h/.claude/CLAUDE.md" "$TESTROOT/seed-claude.md"
 check "uninstall removed skill link" test ! -e "$h/.claude/skills/agent-recall"
+check "uninstall removed save skill link" test ! -e "$h/.claude/skills/agent-recall-save"
 check "retention restored to 7" jq -e '.cleanupPeriodDays == 7' "$h/.claude/settings.json"
 check "second-home retention key deleted" jq -e 'has("cleanupPeriodDays") | not' "$h/.claude-second/settings.json"
 check "backup archived after restore" bash -c 'ls "'"$R"'/state/install-backups/claude-primary.json.restored-"* >/dev/null 2>&1'
@@ -238,6 +273,38 @@ ln -s "$h/elsewhere" "$h/.claude/skills/agent-recall"
 run_i "$h" > /dev/null 2>&1; rc=$?
 check "foreign skill symlink blocks install" test "$rc" -ne 0
 check "foreign skill symlink untouched" test "$(readlink "$h/.claude/skills/agent-recall")" = "$h/elsewhere"
+
+echo "# save skill link ownership preflight"
+h="$(new_home f-save-live)"
+mkdir -p "$h/elsewhere"
+ln -s "$h/elsewhere" "$h/.claude/skills/agent-recall-save"
+cp "$h/.claude/CLAUDE.md" "$h/instructions.before"
+run_i "$h" > /dev/null 2>"$h/err"; rc=$?
+check "foreign live save symlink blocks install" test "$rc" -ne 0
+check "foreign live save symlink preserved" test "$(readlink "$h/.claude/skills/agent-recall-save")" = "$h/elsewhere"
+check "live collision occurs before root mutation" test ! -e "$h/recall root"
+check "live collision leaves instructions unchanged" cmp -s "$h/.claude/CLAUDE.md" "$h/instructions.before"
+
+h="$(new_home f-save-dead)"
+ln -s "$h/missing-target" "$h/.claude/skills/agent-recall-save"
+run_i "$h" > /dev/null 2>"$h/err"; rc=$?
+check "foreign dead save symlink blocks install" test "$rc" -ne 0
+check "foreign dead save symlink preserved" test "$(readlink "$h/.claude/skills/agent-recall-save")" = "$h/missing-target"
+check "dead collision occurs before root mutation" test ! -e "$h/recall root"
+
+h="$(new_home f-save-dir)"
+mkdir -p "$h/.claude/skills/agent-recall-save"
+run_i "$h" > /dev/null 2>"$h/err"; rc=$?
+check "foreign save directory blocks install" test "$rc" -ne 0
+check "foreign save directory preserved" test -d "$h/.claude/skills/agent-recall-save"
+check "directory collision occurs before root mutation" test ! -e "$h/recall root"
+
+h="$(new_home f-save-uninstall)"
+mkdir -p "$h/elsewhere"
+ln -s "$h/elsewhere" "$h/.claude/skills/agent-recall-save"
+run_i "$h" --uninstall > /dev/null 2>&1; rc=$?
+check "uninstall with foreign save link exits 0" test "$rc" -eq 0
+check "uninstall preserves foreign save link" test "$(readlink "$h/.claude/skills/agent-recall-save")" = "$h/elsewhere"
 
 echo "# codex AGENTS.override.md"
 h="$(new_home g)"
