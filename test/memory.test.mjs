@@ -42,6 +42,79 @@ test("projectKey binds the physical Git directory identity", () => {
   assert.notEqual(after.gitIno, before.gitIno);
 });
 
+test("projectKey rejects broken Git markers and failures after repository detection", {
+  skip: process.platform === "win32",
+}, () => {
+  const broken = [
+    {
+      name: "empty-directory",
+      prepare(project) { fs.mkdirSync(path.join(project, ".git"), { mode: 0o700 }); },
+    },
+    {
+      name: "missing-gitdir",
+      prepare(project) {
+        fs.writeFileSync(path.join(project, ".git"), "gitdir: /definitely/missing/git-dir\n");
+      },
+    },
+    {
+      name: "unreadable-directory",
+      prepare(project) {
+        fs.mkdirSync(path.join(project, ".git"), { mode: 0o000 });
+        fs.chmodSync(path.join(project, ".git"), 0o000);
+      },
+    },
+    {
+      name: "symlink-marker",
+      prepare(project) {
+        fs.symlinkSync(path.join(project, "missing-target"), path.join(project, ".git"));
+      },
+    },
+  ];
+  for (const fixture of broken) {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), `recall-broken-${fixture.name}-`));
+    fixture.prepare(project);
+    assert.throws(
+      () => projectKey(project),
+      /Git metadata exists but cannot be verified/,
+      fixture.name,
+    );
+  }
+
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), "recall-git-probe-race-"));
+  assert.equal(spawnSync("git", ["init", "-q", project]).status, 0);
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "recall-git-shim-"));
+  const shim = path.join(shimDir, "git");
+  const countFile = path.join(shimDir, "count");
+  const realGit = spawnSync("/usr/bin/which", ["git"], { encoding: "utf8" }).stdout.trim();
+  assert.ok(realGit);
+  fs.writeFileSync(shim, [
+    "#!/bin/sh",
+    "count=0",
+    "if [ -f \"$GIT_SHIM_COUNT\" ]; then IFS= read -r count < \"$GIT_SHIM_COUNT\"; fi",
+    "count=$((count + 1))",
+    "printf '%s\\n' \"$count\" > \"$GIT_SHIM_COUNT\"",
+    "\"$GIT_SHIM_REAL\" \"$@\"",
+    "status=$?",
+    "if [ \"$count\" -eq 1 ]; then mv \"$GIT_SHIM_PROJECT/.git\" \"$GIT_SHIM_PROJECT/.git-removed\"; fi",
+    "exit \"$status\"",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${shimDir}:${oldPath}`;
+  process.env.GIT_SHIM_COUNT = countFile;
+  process.env.GIT_SHIM_REAL = realGit;
+  process.env.GIT_SHIM_PROJECT = project;
+  try {
+    assert.throws(() => projectKey(project), /not a git repository|Command failed/);
+  } finally {
+    process.env.PATH = oldPath;
+    delete process.env.GIT_SHIM_COUNT;
+    delete process.env.GIT_SHIM_REAL;
+    delete process.env.GIT_SHIM_PROJECT;
+    fs.renameSync(path.join(project, ".git-removed"), path.join(project, ".git"));
+  }
+});
+
 test("remember writes global and project facts with frontmatter", () => {
   const g = remember("We always use tabs", { cwd });
   assert.equal(g.scope, "global");

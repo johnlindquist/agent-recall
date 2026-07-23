@@ -284,3 +284,42 @@ test("persisted malformed UTF-8 proposals fail closed before JSON or hash valida
   ]));
   assert.throws(() => loadMemoryProposal(receipt.proposalId), /not valid UTF-8/);
 });
+
+test("project-capable CLI staging rejects broken Git metadata without side effects", {
+  skip: process.platform === "win32",
+}, () => {
+  const fixtures = [
+    {
+      name: "empty",
+      prepare(project) { fs.mkdirSync(path.join(project, ".git"), { mode: 0o700 }); },
+    },
+    {
+      name: "missing-target",
+      prepare(project) {
+        fs.writeFileSync(path.join(project, ".git"), "gitdir: /definitely/missing/git-dir\n");
+      },
+    },
+    {
+      name: "unreadable",
+      prepare(project) {
+        fs.mkdirSync(path.join(project, ".git"), { mode: 0o000 });
+        fs.chmodSync(path.join(project, ".git"), 0o000);
+      },
+    },
+  ];
+  for (const fixture of fixtures) {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), `recall-stage-broken-${fixture.name}-`));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `recall-stage-root-${fixture.name}-`));
+    fixture.prepare(project);
+    const result = spawnSync(process.execPath, [cli, "propose-memory", "--json"], {
+      cwd: project,
+      env: { ...process.env, RECALL_HOME: root, NODE_NO_WARNINGS: "1" },
+      input: JSON.stringify(explicitRequest("must not stage against broken Git", "project")),
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0, fixture.name);
+    assert.match(result.stderr, /Git metadata exists but cannot be verified/, fixture.name);
+    assert.equal(fs.existsSync(path.join(root, "state/memory-proposals")), false, fixture.name);
+    assert.equal(fs.existsSync(path.join(root, "memory")), false, fixture.name);
+  }
+});

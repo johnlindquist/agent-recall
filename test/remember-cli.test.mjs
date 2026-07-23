@@ -558,6 +558,31 @@ test("replacing the Git directory at the same path after preview fails closed", 
   assert.ok(fs.existsSync(proposalFile));
 });
 
+test("breaking Git metadata after preview fails closed and retains the proposal", async () => {
+  const root = fresh("recall-cli-git-broken-");
+  const project = fresh("recall-cli-git-broken-project-");
+  assert.equal(spawnSync("git", ["init", "-q", project]).status, 0);
+  const receipt = stage(root, explicit("broken Git identity must fail", "project"), project);
+  const proposalFile = path.join(root, "state/memory-proposals", receipt.proposalId + ".json");
+  const release = holdMemoryWriteLock(root);
+  let broken = false;
+  const resultPromise = ttyRunAsync(root, receipt.proposalId, [
+    { expect: "Type SAVE", send: "SAVE" },
+  ], project, (chunk) => {
+    if (!broken && chunk.includes("Type SAVE")) {
+      broken = true;
+      fs.renameSync(path.join(project, ".git"), path.join(project, ".git-original"));
+      fs.mkdirSync(path.join(project, ".git"), { mode: 0o700 });
+      release();
+    }
+  });
+  const result = await resultPromise;
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout + result.stderr, /Git metadata exists but cannot be verified/);
+  assert.equal(fs.existsSync(path.join(root, "memory")), false);
+  assert.ok(fs.existsSync(proposalFile));
+});
+
 test("malformed UTF-8, misplaced metadata, and oversized target stores abort and retain proposals", () => {
   const cases = [
     {
