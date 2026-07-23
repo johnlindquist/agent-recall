@@ -110,7 +110,7 @@ function ttyForget(root, match, cwd = repo) {
 }
 
 const explicit = (text, scope = null) => ({
-  schemaVersion: 2,
+  schemaVersion: 3,
   mode: "explicit",
   text,
   scope,
@@ -281,10 +281,21 @@ test("proposal that expires while waiting for memory-write.lock writes nothing",
   value.createdAt = new Date(expires - 30 * 60 * 1000).toISOString();
   fs.writeFileSync(file, JSON.stringify(value));
   const release = holdMemoryWriteLock(root);
+  let sawSavePrompt;
+  const savePrompt = new Promise((resolve) => { sawSavePrompt = resolve; });
   const resultPromise = ttyRunAsync(root, receipt.proposalId, [
     { expect: "Type SAVE", send: "SAVE" },
+  ], repo, (chunk) => {
+    if (chunk.includes("Type SAVE")) sawSavePrompt();
+  });
+  await Promise.race([
+    savePrompt,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error("acceptance did not reach the SAVE prompt")),
+      10_000,
+    )),
   ]);
-  await new Promise((resolve) => setTimeout(resolve, 1_800));
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, expires - Date.now()) + 500));
   release();
   const result = await resultPromise;
   assert.notEqual(result.status, 0);
@@ -296,7 +307,7 @@ test("proposal that expires while waiting for memory-write.lock writes nothing",
 test("duplicate items inside one proposal create only one fact", () => {
   const root = fresh("recall-cli-intra-proposal-");
   const receipt = stage(root, {
-    schemaVersion: 2,
+    schemaVersion: 3,
     mode: "candidates",
     text: "Memory candidate (global): same batch fact\nMemory candidate (global): same batch fact",
     scopeOverride: null,
@@ -429,7 +440,7 @@ test("project acceptance is bound to the staged project and fails if it disappea
   const root = fresh("recall-cli-binding-");
   const project = fresh("recall-cli-bound-project-");
   const receipt = stage(root, {
-    schemaVersion: 2,
+    schemaVersion: 3,
     mode: "candidates",
     text: "Memory candidate (project): bound project fact",
     scopeOverride: null,
@@ -443,7 +454,7 @@ test("project acceptance is bound to the staged project and fails if it disappea
 
   const doomed = fresh("recall-cli-doomed-project-");
   const doomedReceipt = stage(root, {
-    schemaVersion: 2,
+    schemaVersion: 3,
     mode: "candidates",
     text: "Memory candidate (project): must not escape deleted project",
     scopeOverride: null,
@@ -522,13 +533,90 @@ test("removing Git identity after preview fails closed and trailing-space roots 
   assert.equal(retry.status, 0, retry.stderr + retry.stdout);
 });
 
+test("replacing the Git directory at the same path after preview fails closed", async () => {
+  const root = fresh("recall-cli-git-replacement-");
+  const project = fresh("recall-cli-git-replacement-project-");
+  assert.equal(spawnSync("git", ["init", "-q", project]).status, 0);
+  const receipt = stage(root, explicit("replacement Git identity must fail", "project"), project);
+  const proposalFile = path.join(root, "state/memory-proposals", receipt.proposalId + ".json");
+  const release = holdMemoryWriteLock(root);
+  let replaced = false;
+  const resultPromise = ttyRunAsync(root, receipt.proposalId, [
+    { expect: "Type SAVE", send: "SAVE" },
+  ], project, (chunk) => {
+    if (!replaced && chunk.includes("Type SAVE")) {
+      replaced = true;
+      fs.renameSync(path.join(project, ".git"), path.join(project, ".git-original"));
+      assert.equal(spawnSync("git", ["init", "-q", project]).status, 0);
+      release();
+    }
+  });
+  const result = await resultPromise;
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout + result.stderr, /proposal project identity has changed/);
+  assert.equal(fs.existsSync(path.join(root, "memory")), false);
+  assert.ok(fs.existsSync(proposalFile));
+});
+
+test("malformed UTF-8, misplaced metadata, and oversized target stores abort and retain proposals", () => {
+  const cases = [
+    {
+      name: "utf8",
+      write(file) {
+        const raw = Buffer.from(
+          "---\nid: hostile\ncreated: 2026-07-22T00:00:00.000Z\nscope: global\nstatus: active\nprovenance: human-cli\n---\n\nbad \ufffd\n",
+        );
+        const at = raw.indexOf(Buffer.from("\ufffd"));
+        fs.writeFileSync(file, Buffer.concat([
+          raw.subarray(0, at),
+          Buffer.from([0xff]),
+          raw.subarray(at + Buffer.byteLength("\ufffd")),
+        ]), { mode: 0o600 });
+      },
+      error: /not valid UTF-8/,
+    },
+    {
+      name: "metadata",
+      write(file) {
+        fs.writeFileSync(file,
+          `---\nid: hostile\ncreated: 2026-07-22T00:00:00.000Z\nscope: project\nproject_key: v2-${"a".repeat(64)}\nstatus: active\nprovenance: human-cli\n---\n\nwrong target\n`,
+          { mode: 0o600 });
+      },
+      error: /invalid memory fact metadata/,
+    },
+    {
+      name: "oversized",
+      write(file) {
+        fs.writeFileSync(file,
+          `---\nid: hostile\ncreated: 2026-07-22T00:00:00.000Z\nscope: global\nstatus: active\nprovenance: human-cli\n---\n\n${"x".repeat(8001)}\n`,
+          { mode: 0o600 });
+      },
+      error: /exceeds 8000 chars/,
+    },
+  ];
+
+  for (const fixture of cases) {
+    const root = fresh(`recall-cli-hostile-store-${fixture.name}-`);
+    const receipt = stage(root, explicit(`hostile store ${fixture.name}`, "global"));
+    const proposalFile = path.join(root, "state/memory-proposals", receipt.proposalId + ".json");
+    const factsDir = path.join(root, "memory/global/facts");
+    fs.mkdirSync(factsDir, { recursive: true, mode: 0o700 });
+    fixture.write(path.join(factsDir, "hostile.md"));
+    const result = ttyRun(root, receipt.proposalId);
+    assert.notEqual(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout + result.stderr, fixture.error);
+    assert.ok(fs.existsSync(proposalFile));
+    assert.deepEqual(fs.readdirSync(factsDir), ["hostile.md"]);
+  }
+});
+
 test("mid-batch failure keeps the proposal and retry does not duplicate the first item", {
   skip: process.platform === "win32",
 }, () => {
   const root = fresh("recall-cli-partial-");
   const project = fresh("recall-cli-project-");
   const receipt = stage(root, {
-    schemaVersion: 2,
+    schemaVersion: 3,
     mode: "candidates",
     text: "Memory candidate (project): partial project fact\nMemory candidate (global): partial global fact",
     scopeOverride: null,

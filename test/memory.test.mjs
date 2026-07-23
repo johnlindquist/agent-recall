@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 process.env.RECALL_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "recall-mem-"));
 const { MEMORY } = await import("../lib/paths.mjs");
@@ -22,6 +23,23 @@ test("projectKey falls back to cwd outside git; variants include pi double-hyphe
   assert.match(pk.dirKey, /^v2-[0-9a-f]{64}$/);
   assert.equal(pk.kind, "plain");
   assert.equal(pk.gitDir, null);
+  assert.equal(pk.gitDev, null);
+  assert.equal(pk.gitIno, null);
+  assert.equal(pk.gitBirthtimeNs, null);
+});
+
+test("projectKey binds the physical Git directory identity", () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), "recall-git-identity-"));
+  assert.equal(spawnSync("git", ["init", "-q", project]).status, 0);
+  const before = projectKey(project);
+  assert.equal(before.kind, "git");
+  assert.match(before.gitDev, /^\d+$/);
+  assert.match(before.gitIno, /^\d+$/);
+  assert.match(before.gitBirthtimeNs, /^\d+$/);
+  fs.renameSync(path.join(project, ".git"), path.join(project, ".git-original"));
+  assert.equal(spawnSync("git", ["init", "-q", project]).status, 0);
+  const after = projectKey(project);
+  assert.notEqual(after.gitIno, before.gitIno);
 });
 
 test("remember writes global and project facts with frontmatter", () => {
@@ -213,4 +231,103 @@ test("mutation-time scans fail closed on unreadable, malformed, and symlink fact
   );
   fs.unlinkSync(link);
   fs.unlinkSync(target);
+});
+
+test("persisted facts require fatal UTF-8 and exact target metadata and body bounds", () => {
+  const writeRawFact = (file, { id, scope, projectKey: key = null, fact }) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const projectLine = scope === "project" ? `project_key: ${key}\n` : "";
+    fs.writeFileSync(file,
+      `---\nid: ${id}\ncreated: 2026-07-22T00:00:00.000Z\nscope: ${scope}\n${projectLine}status: active\nprovenance: human-cli\n---\n\n${fact}\n`,
+      { mode: 0o600 });
+  };
+
+  const globalDir = path.join(MEMORY, "global/facts");
+  const malformedUtf8 = path.join(globalDir, "malformed-utf8.md");
+  writeRawFact(malformedUtf8, {
+    id: "malformed-utf8",
+    scope: "global",
+    fact: "literal replacement \ufffd",
+  });
+  const validBytes = fs.readFileSync(malformedUtf8);
+  const replacementAt = validBytes.indexOf(Buffer.from("\ufffd"));
+  assert.ok(replacementAt >= 0);
+  fs.writeFileSync(malformedUtf8, Buffer.concat([
+    validBytes.subarray(0, replacementAt),
+    Buffer.from([0xff]),
+    validBytes.subarray(replacementAt + Buffer.byteLength("\ufffd")),
+  ]));
+  assert.throws(() => contextFacts({ cwd }), /not valid UTF-8/);
+  fs.unlinkSync(malformedUtf8);
+
+  const projectA = fs.mkdtempSync(path.join(os.tmpdir(), "recall-target-a-"));
+  const projectB = fs.mkdtempSync(path.join(os.tmpdir(), "recall-target-b-"));
+  const targetA = projectKey(projectA);
+  const targetB = projectKey(projectB);
+  const dirA = path.join(MEMORY, "projects", targetA.dirKey, "facts");
+  const dirB = path.join(MEMORY, "projects", targetB.dirKey, "facts");
+
+  const globalInProject = path.join(dirA, "global-in-project.md");
+  writeRawFact(globalInProject, {
+    id: "global-in-project",
+    scope: "global",
+    fact: "wrong directory",
+  });
+  assert.throws(() => contextFacts({ cwd: projectA }), /invalid memory fact metadata/);
+  fs.unlinkSync(globalInProject);
+
+  const projectAInB = path.join(dirB, "project-a-in-b.md");
+  writeRawFact(projectAInB, {
+    id: "project-a-in-b",
+    scope: "project",
+    projectKey: targetA.dirKey,
+    fact: "wrong project binding",
+  });
+  assert.throws(() => contextFacts({ cwd: projectB }), /invalid memory fact metadata/);
+  fs.unlinkSync(projectAInB);
+
+  const oversized = path.join(dirB, "oversized-body.md");
+  writeRawFact(oversized, {
+    id: "oversized-body",
+    scope: "project",
+    projectKey: targetB.dirKey,
+    fact: "x".repeat(8001),
+  });
+  assert.throws(() => contextFacts({ cwd: projectB }), /exceeds 8000 chars/);
+  fs.unlinkSync(oversized);
+});
+
+test("publication compares exact bytes and removes a mismatched visible fact", () => {
+  const originalWrite = fs.writeFileSync;
+  const before = fs.readdirSync(path.join(MEMORY, "global/facts"))
+    .filter((name) => name.endsWith(".md")).sort();
+  let injected = false;
+  fs.writeFileSync = function faultInject(target, data, ...args) {
+    if (!injected && typeof target === "number" && Buffer.isBuffer(data)) {
+      const at = data.indexOf(Buffer.from("\ufffd"));
+      if (at >= 0) {
+        injected = true;
+        data = Buffer.concat([
+          data.subarray(0, at),
+          Buffer.from([0xff]),
+          data.subarray(at + Buffer.byteLength("\ufffd")),
+        ]);
+      }
+    }
+    return originalWrite.call(this, target, data, ...args);
+  };
+  try {
+    assert.throws(
+      () => remember("publication byte fault \ufffd", { cwd }),
+      /memory fact readback mismatch/,
+    );
+  } finally {
+    fs.writeFileSync = originalWrite;
+  }
+  assert.equal(injected, true);
+  assert.deepEqual(
+    fs.readdirSync(path.join(MEMORY, "global/facts"))
+      .filter((name) => name.endsWith(".md")).sort(),
+    before,
+  );
 });

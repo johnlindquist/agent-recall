@@ -40,13 +40,13 @@ Build one strict JSON request.
 Candidate mode:
 
 ```json
-{"schemaVersion":2,"mode":"candidates","text":"Memory candidate (project): exact payload\nMemory candidate (global): exact payload","scopeOverride":null}
+{"schemaVersion":3,"mode":"candidates","text":"Memory candidate (project): exact payload\nMemory candidate (global): exact payload","scopeOverride":null}
 ```
 
 Explicit mode:
 
 ```json
-{"schemaVersion":2,"mode":"explicit","text":"exact user payload","scope":null}
+{"schemaVersion":3,"mode":"explicit","text":"exact user payload","scope":null}
 ```
 
 Use `"project"` or `"global"` for an explicit selector; otherwise use `null`.
@@ -55,7 +55,7 @@ heredoc to the only command this skill may execute:
 
 ```sh
 recall propose-memory --json <<'JSON'
-{"schemaVersion":2,"mode":"explicit","text":"exact user payload","scope":null}
+{"schemaVersion":3,"mode":"explicit","text":"exact user payload","scope":null}
 JSON
 ```
 

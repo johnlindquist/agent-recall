@@ -24,13 +24,13 @@ const { MEMORY_PROPOSALS, MEMORY } = await import("../lib/paths.mjs");
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "recall-proposal-project-"));
 const cli = fileURLToPath(new URL("../bin/recall.mjs", import.meta.url));
 const candidateRequest = (text, scopeOverride = null) => ({
-  schemaVersion: 2,
+  schemaVersion: 3,
   mode: "candidates",
   text,
   scopeOverride,
 });
 const explicitRequest = (text, scope = null) => ({
-  schemaVersion: 2,
+  schemaVersion: 3,
   mode: "explicit",
   text,
   scope,
@@ -88,12 +88,12 @@ test("strict request schema preserves explicit text and applies only explicit sc
 test("strict request schema rejects unknown keys, modes, versions, scopes, empties, and oversized facts", () => {
   const bad = [
     { ...explicitRequest("x"), extra: true },
-    { ...explicitRequest("x"), schemaVersion: 3 },
+    { ...explicitRequest("x"), schemaVersion: 2 },
     { ...explicitRequest("x"), mode: "automatic" },
     explicitRequest("x", "other"),
     explicitRequest("  ", "global"),
     explicitRequest("x".repeat(8001), "global"),
-    { schemaVersion: 2, mode: "candidates", text: "Memory candidate: x" },
+    { schemaVersion: 3, mode: "candidates", text: "Memory candidate: x" },
   ];
   for (const value of bad) assert.throws(() => parseProposalRequest(value));
   assert.throws(() => parseProposalRequest("{not json"));
@@ -266,4 +266,21 @@ test("corrupt, hash-mismatched, wrong-version, and symlink proposals fail closed
   fs.renameSync(file, target);
   fs.symlinkSync(target, file);
   assert.throws(() => loadMemoryProposal(receipt.proposalId), /regular file/);
+});
+
+test("persisted malformed UTF-8 proposals fail closed before JSON or hash validation", () => {
+  const receipt = createMemoryProposal(
+    parseProposalRequest(explicitRequest("literal replacement \ufffd", "global")),
+    { cwd },
+  );
+  const file = path.join(MEMORY_PROPOSALS, receipt.proposalId + ".json");
+  const valid = fs.readFileSync(file);
+  const at = valid.indexOf(Buffer.from("\ufffd"));
+  assert.ok(at >= 0);
+  fs.writeFileSync(file, Buffer.concat([
+    valid.subarray(0, at),
+    Buffer.from([0xff]),
+    valid.subarray(at + Buffer.byteLength("\ufffd")),
+  ]));
+  assert.throws(() => loadMemoryProposal(receipt.proposalId), /not valid UTF-8/);
 });

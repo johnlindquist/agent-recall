@@ -484,6 +484,9 @@ function verifyProposalProject(project) {
   if (currentTop !== project.top ||
       current.kind !== project.kind ||
       current.gitDir !== project.gitDir ||
+      current.gitDev !== project.gitDev ||
+      current.gitIno !== project.gitIno ||
+      current.gitBirthtimeNs !== project.gitBirthtimeNs ||
       current.dev !== project.dev ||
       current.ino !== project.ino ||
       current.base !== project.base ||
@@ -493,6 +496,9 @@ function verifyProposalProject(project) {
     kind: project.kind,
     top: project.top,
     gitDir: project.gitDir,
+    gitDev: project.gitDev,
+    gitIno: project.gitIno,
+    gitBirthtimeNs: project.gitBirthtimeNs,
     dev: project.dev,
     ino: project.ino,
     base: project.base,
@@ -921,7 +927,7 @@ async function cmdSelfTest() {
   const cov = coverage(db);
   assert("coverage reports selftest source", !!cov.perSource.selftest && cov.perSource.selftest.events > 0);
   const proposalRequest = proposals.parseProposalRequest({
-    schemaVersion: 2,
+    schemaVersion: 3,
     mode: "explicit",
     text: "self-test proposal exact — evidence: isolated self-test",
     scope: "global",
