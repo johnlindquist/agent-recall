@@ -6,7 +6,7 @@ import path from "node:path";
 
 process.env.RECALL_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "recall-mem-"));
 const { MEMORY } = await import("../lib/paths.mjs");
-const { remember, contextFacts, forget, projectKey } = await import("../lib/memory.mjs");
+const { remember, contextFacts, forget, projectKey, findActiveDuplicate } = await import("../lib/memory.mjs");
 
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "recall-proj-"));
 const base = path.basename(fs.realpathSync(cwd));
@@ -39,6 +39,30 @@ test("remember writes global and project facts with frontmatter", () => {
 test("remember rejects empty and oversized facts", () => {
   assert.throws(() => remember("   ", { cwd }));
   assert.throws(() => remember("x".repeat(8001), { cwd }));
+});
+
+test("remember round-trips exact whitespace, newlines, Unicode, quotes, and evidence", () => {
+  const exact = "  “Quoted” Unicode — line one\nline two — evidence: exact fixture.  \n";
+  const result = remember(exact, { cwd });
+  assert.ok(result.id);
+  const found = contextFacts({ cwd }).find((fact) => fact.id === result.id);
+  assert.equal(found.fact, exact);
+});
+
+test("findActiveDuplicate is exact, active, and scope-specific", () => {
+  const exact = "duplicate fixture — evidence: same scope";
+  const global = remember(exact, { cwd });
+  assert.equal(findActiveDuplicate(exact, { cwd })?.id, global.id);
+  assert.equal(findActiveDuplicate(exact.toUpperCase(), { cwd }), null);
+  assert.equal(findActiveDuplicate(exact, { project: true, cwd }), null);
+
+  const project = remember(exact, { project: true, cwd });
+  assert.equal(findActiveDuplicate(exact, { project: true, cwd })?.id, project.id);
+  assert.deepEqual(forget(global.id, { cwd }), { action: "retracted", id: global.id });
+  assert.equal(findActiveDuplicate(exact, { cwd }), null);
+  const replacement = remember(exact, { cwd });
+  assert.notEqual(replacement.id, global.id);
+  assert.equal(findActiveDuplicate(exact, { cwd })?.id, replacement.id);
 });
 
 test("contextFacts returns both scopes and flags stale by created date", () => {

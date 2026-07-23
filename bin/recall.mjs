@@ -15,6 +15,7 @@ import * as dbmod from "../lib/db.mjs";
 import { coverage, banner, manifest } from "../lib/coverage.mjs";
 import { resumeHint } from "../lib/resume.mjs";
 import * as memory from "../lib/memory.mjs";
+import * as proposals from "../lib/memory-proposals.mjs";
 
 const { clean, display } = textmod;
 const { dbOpen, indexAll, needsRebuild, rebuild } = dbmod;
@@ -29,7 +30,9 @@ usage:
   recall search <words> [--all] [--raw] [--json] [--source NAME] [--include-unscoped] [--]
   recall show <n> | summary <n>       context / structural summary for hit n
   recall sync [--quiet]               archive + index now (launchd runs this)
-  recall remember "<fact>" [--project]
+  recall propose-memory --json          stage an expiring proposal; never writes curated memory
+  recall remember --accept <id>         interactively review and accept a proposal
+  recall remember "<fact>" [--project|--global] [--]
   recall context [--json]             curated facts (agents: read-only)
   recall forget "<text or id>"        retract a fact (file preserved)
   recall doctor                       health + per-source coverage
@@ -403,18 +406,171 @@ function cmdSummary(args) {
   console.log(`LAST ANSWER: ${oneLine(closer?.text || "(none)").slice(0, 800)}`);
 }
 
-function cmdRemember(args) {
+function readBoundedStdin(maxBytes = 64 * 1024) {
+  const chunks = [];
+  let total = 0;
+  const buf = Buffer.alloc(8192);
+  while (true) {
+    const count = fs.readSync(0, buf, 0, buf.length, null);
+    if (count === 0) break;
+    total += count;
+    if (total > maxBytes) throw new UsageError(`stdin exceeds ${maxBytes} bytes`);
+    chunks.push(Buffer.from(buf.subarray(0, count)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function readTerminalLine(prompt) {
+  process.stdout.write(prompt);
+  const bytes = [];
+  const one = Buffer.alloc(1);
+  const waitCell = new Int32Array(new SharedArrayBuffer(4));
+  while (bytes.length <= 8192) {
+    let count;
+    try {
+      count = fs.readSync(0, one, 0, 1, null);
+    } catch (error) {
+      if (error?.code === "EAGAIN" || error?.code === "EWOULDBLOCK") {
+        Atomics.wait(waitCell, 0, 0, 10);
+        continue;
+      }
+      throw error;
+    }
+    if (count === 0 || one[0] === 10) break;
+    // A real terminal's line discipline consumes editing/control bytes. Some
+    // pseudo-TTY drivers expose their EOF/backspace bookkeeping directly, so
+    // ignore C0 controls here and compare only the visible response token.
+    if (one[0] >= 32 && one[0] !== 127) bytes.push(one[0]);
+  }
+  if (bytes.length > 8192) throw new Error("terminal response is too long");
+  return Buffer.from(bytes).toString("utf8");
+}
+
+function requireInteractiveRemember() {
   // A25: memory writes are human-only — require an interactive terminal so a
   // prompt-injected agent cannot persist facts non-interactively. (Same-UID
   // malware remains out of scope; this blocks the confused-deputy path.)
-  if (!process.stdin.isTTY && process.env.RECALL_ALLOW_NONTTY_REMEMBER !== "1") {
+  if (!process.stdin.isTTY) {
     console.error("recall remember requires an interactive terminal (agents propose; humans save)");
     process.exit(77);
   }
-  const project = args.includes("--project");
-  const fact = args.filter((a) => !a.startsWith("--")).join(" ").trim();
+}
+
+function verifyProposalProject(project) {
+  if (!project) return;
+  let stat, top;
+  try {
+    stat = fs.statSync(project.top);
+    top = fs.realpathSync(project.top);
+  } catch {
+    throw new Error("proposal project no longer exists");
+  }
+  if (!stat.isDirectory()) throw new Error("proposal project is no longer a directory");
+  const current = memory.projectKey(top);
+  let currentTop;
+  try { currentTop = fs.realpathSync(current.top); }
+  catch { throw new Error("proposal project identity cannot be verified"); }
+  if (currentTop !== project.top || current.base !== project.base || current.dirKey !== project.dirKey)
+    throw new Error("proposal project identity has changed");
+}
+
+function cmdAcceptProposal(args) {
+  if (args.length !== 2 || args[0] !== "--accept" || !proposals.PROPOSAL_ID_RE.test(args[1] || ""))
+    throw new UsageError("usage: recall remember --accept <32-character proposal id>");
+  requireInteractiveRemember();
+  const proposal = proposals.loadMemoryProposal(args[1]);
+  verifyProposalProject(proposal.project);
+
+  const resolved = [];
+  for (const [index, item] of proposal.items.entries()) {
+    let scope = item.scope;
+    if (scope === null) {
+      const projectLabel = proposal.project
+        ? `project:${proposal.project.base} at ${proposal.project.top}`
+        : "project (unavailable)";
+      const choice = readTerminalLine(
+        `Scope for item ${index + 1}:\n  p = ${projectLabel}\n  g = global\n  c = cancel\nChoice: `,
+      );
+      if (choice === "c") { console.log("cancelled; proposal kept"); return; }
+      if (choice === "p" && proposal.project) scope = "project";
+      else if (choice === "g") scope = "global";
+      else { console.log("cancelled; no scope selected and proposal kept"); return; }
+    }
+    const project = scope === "project";
+    const cwd = proposal.project?.top || process.cwd();
+    const duplicate = memory.findActiveDuplicate(item.fact, { project, cwd });
+    resolved.push({ ...item, scope, project, cwd, duplicate });
+  }
+
+  console.log("Memory proposal preview:");
+  for (const [index, item] of resolved.entries()) {
+    const label = item.project ? `project:${proposal.project.base}` : "global";
+    console.log(`${index + 1}. scope=${label}`);
+    console.log(`   fact=${JSON.stringify(item.fact)}`);
+    console.log(`   sha256=${item.sha256}`);
+    console.log(`   duplicate=${item.duplicate ? `active id=${item.duplicate.id}` : "none"}`);
+  }
+  const newCount = resolved.filter((item) => !item.duplicate).length;
+  const confirmation = readTerminalLine(
+    `Type SAVE to persist ${newCount} new ${newCount === 1 ? "memory" : "memories"}: `,
+  );
+  if (confirmation !== "SAVE") { console.log("cancelled; nothing written and proposal kept"); return; }
+
+  const receipts = [];
+  for (const [index, item] of resolved.entries()) {
+    if (item.duplicate) {
+      receipts.push(`already active ${item.duplicate.scope} id=${item.duplicate.id}`);
+      continue;
+    }
+    try {
+      const result = memory.remember(item.fact, { project: item.project, cwd: item.cwd });
+      receipts.push(`remembered ${result.scope} id=${result.id}`);
+    } catch (error) {
+      for (const receipt of receipts) console.log(receipt);
+      console.error(`item ${index + 1} failed: ${error?.message || error}`);
+      throw new Error("proposal partially applied; proposal kept for an idempotent retry");
+    }
+  }
+  proposals.removeMemoryProposal(args[1]);
+  for (const receipt of receipts) console.log(receipt);
+}
+
+function parseLegacyRemember(args) {
+  let project = false;
+  let sawScope = false;
+  let positionalOnly = false;
+  const words = [];
+  for (const arg of args) {
+    if (!positionalOnly && arg === "--") { positionalOnly = true; continue; }
+    if (!positionalOnly && (arg === "--project" || arg === "--global")) {
+      if (sawScope) throw new UsageError("recall remember accepts only one scope flag");
+      sawScope = true;
+      project = arg === "--project";
+      continue;
+    }
+    if (!positionalOnly && arg.startsWith("-"))
+      throw new UsageError(`unknown recall remember option: ${arg}`);
+    words.push(arg);
+  }
+  const fact = words.join(" ");
+  if (!fact.trim()) throw new UsageError('usage: recall remember "<fact>" [--project|--global] [--]');
+  return { fact, project };
+}
+
+function cmdRemember(args) {
+  if (args[0] === "--accept") return cmdAcceptProposal(args);
+  const { fact, project } = parseLegacyRemember(args);
+  requireInteractiveRemember();
   const r = memory.remember(fact, { project });
-  console.log(`remembered (${r.scope}): ${oneLine(fact).slice(0, 80)}`);
+  console.log(`remembered ${r.scope} id=${r.id}: ${oneLine(fact).slice(0, 80)}`);
+}
+
+function cmdProposeMemory(args) {
+  if (args.length !== 1 || args[0] !== "--json")
+    throw new UsageError("usage: recall propose-memory --json");
+  const request = proposals.parseProposalRequest(readBoundedStdin());
+  const receipt = proposals.createMemoryProposal(request);
+  console.log(JSON.stringify(receipt));
 }
 
 function cmdContext(args) {
@@ -646,6 +802,19 @@ async function cmdSelfTest() {
   // per-source coverage present in the envelope
   const cov = coverage(db);
   assert("coverage reports selftest source", !!cov.perSource.selftest && cov.perSource.selftest.events > 0);
+  const proposalRequest = proposals.parseProposalRequest({
+    schemaVersion: 1,
+    mode: "explicit",
+    text: "self-test proposal exact — evidence: isolated self-test",
+    scope: "global",
+  });
+  const proposalReceipt = proposals.createMemoryProposal(proposalRequest, { cwd: dir });
+  const staged = proposals.loadMemoryProposal(proposalReceipt.proposalId);
+  assert("memory proposal stages exact text without writing memory",
+    proposalReceipt.memoryWritten === false &&
+    staged.items[0].fact === "self-test proposal exact — evidence: isolated self-test" &&
+    memory.contextFacts({ cwd: dir }).length === 0);
+  proposals.removeMemoryProposal(proposalReceipt.proposalId);
   console.log("SELF-TEST PASS");
 }
 
@@ -670,6 +839,7 @@ const run = {
   search: () => cmdSearch(args),
   show: () => cmdShow(args),
   summary: () => cmdSummary(args),
+  "propose-memory": () => cmdProposeMemory(args),
   remember: () => cmdRemember(args),
   context: () => cmdContext(args),
   forget: () => cmdForget(args),
