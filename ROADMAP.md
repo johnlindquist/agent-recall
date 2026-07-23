@@ -31,6 +31,10 @@ building it — the discipline is: no trigger, no build.
 | Cross-machine sync | A second machine on the same projects ≥3 days/week (one-time moves: migrate pack) |
 | Search scope ergonomics for unscoped events (some grok/kimi records hide behind `--include-unscoped`) | It bites in practice — then solve in TUI filters, not core |
 
+`agent-recall-save` is deliberately narrower than the deferred session-end
+automation: it is an explicit user-initiated acceptance mechanism, not automatic
+extraction, autonomous memory writing, or a session-end trigger.
+
 ## Deferred indefinitely (documented, low regret)
 
 - **Agent-safe output mode** (opaque ids, TTY-gated full search) — the

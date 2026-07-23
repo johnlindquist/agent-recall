@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Recall Save"
+  short_description: "Stage memory candidates for human approval"
+  default_prompt: "Use $agent-recall-save to stage the memory I just supplied for interactive approval."

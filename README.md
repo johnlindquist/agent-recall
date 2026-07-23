@@ -65,13 +65,62 @@ minutes, and adds a managed instruction block + skill so your agents are
 recall search <words> [--all] [--raw] [--json] [--source NAME] [--include-unscoped]
 recall show <n> | summary <n>    context / opening-ask+last-answer for hit n
 recall sync                      archive + index now (launchd does this every 30m)
-recall remember "<fact>" [--project]   # human-only: requires an interactive terminal
+recall propose-memory --json      stage a 30-minute proposal; writes no curated memory
+recall remember --accept <id>     review a proposal; interactive terminal + exact SAVE required
+recall remember "<fact>" [--project|--global] [--]  # direct human-only path
 recall context                   curated facts (read-only for agents; stale facts flagged)
 recall forget "<text or id>"     retract a fact (file preserved, excluded from context)
 recall doctor                    health + per-source coverage + integrity checks
 recall agy-enable                enable the Antigravity snapshot lane (runs a WAL canary gate first)
 recall index [--rebuild] | archive | self-test
 ```
+
+## Saving proposed memories
+
+The installed `agent-recall-save` skill is an explicit, two-phase acceptance
+flow. An agent may stage a proposal only after the current user asks it to save
+explicit text or accept the most recent candidate block. Staging returns
+`memoryWritten: false`; proposals never appear in `recall context` and expire
+after 30 minutes. The agent returns:
+
+```sh
+recall remember --accept <proposal-id>
+```
+
+Run that command yourself in an interactive terminal. It previews the exact
+JSON-escaped facts, scopes, hashes, and duplicate status, then requires the
+case-sensitive token `SAVE`. Project scope is bound when the proposal is staged,
+even if acceptance runs from another directory. Exact active duplicates in the
+same scope are idempotent; identical text in global and project scope remains
+two distinct facts. Evidence suffixes are ordinary exact fact text.
+
+With no explicit payload, the skill reads only the immediately preceding
+assistant turn's final contiguous block of one or two canonical lines:
+
+```text
+Memory candidate (project): Use Base UI, not Radix — evidence: package.json.
+Memory candidate (global): Prefer exact UTC dates in release notes.
+```
+
+It does not search older turns or recalled history. Examples:
+
+```text
+User: Accept the project memory candidate.
+Agent: Proposal staged; nothing has been saved yet. Run: recall remember --accept <id>
+
+User: agent-recall-save Remember "quotes", Unicode — punctuation,
+      and this second line exactly.
+Agent: Proposal staged with unresolved scope; nothing has been saved yet.
+
+Duplicate: the terminal reports "already active" and creates no second file.
+Expired: acceptance fails closed; stage a fresh proposal.
+No candidate: the skill reports that no valid recent candidate block exists.
+```
+
+This does not add automatic extraction, session-end automation, fuzzy
+deduplication, bulk memory management, agent-side acceptance, background memory
+services, cross-machine sync, or automatic superseding. Humans can still use
+direct `recall remember "<fact>" [--project|--global]`.
 
 ## Why it's built this way
 
@@ -171,9 +220,10 @@ overwriting instead of appending
 and every mainline agent asked to build Memory Bank in declined, calling any
 memory schema too opinionated for a general tool
 ([RooCodeInc/Roo-Code#3312](https://github.com/RooCodeInc/Roo-Code/issues/3312)).
-So here: nothing persists automatically; agents propose plain-text
-candidates; `recall remember` refuses non-interactive callers (a
-prompt-injected agent cannot write memory); facts retract without deletion,
+So here: nothing persists automatically; agents propose plain-text candidates
+or stage short-lived proposals only after an explicit user request;
+`recall remember` refuses non-interactive callers (a prompt-injected agent
+cannot write memory); facts retract without deletion,
 age with staleness flags, and are read as pointers to verify against
 reality — because shipped auto-memory's top complaint quickly becomes "the
 model ignores it or trusts it stale"
