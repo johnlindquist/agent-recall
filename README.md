@@ -32,8 +32,8 @@ known — the exact command to reopen that session.
 | --- | --- | --- |
 | Claude Code (two config homes) | `~/.claude/projects`, `~/.claude-second/projects` | append-preserving JSONL |
 | Codex CLI | `~/.codex/sessions` + `archived_sessions` | append-preserving JSONL (envelope-aware parser) |
-| Grok CLI | `~/.grok/sessions` | append-preserving; JSONL indexed, pretty-JSON via `--raw` |
-| Kimi CLI | `~/.kimi-code/sessions` (+ legacy `~/.kimi/sessions`) | append-preserving JSONL (`wire.jsonl`, session-from-path) |
+| Grok CLI | `~/.grok/sessions` | append-preserving; structured JSONL indexed, diagnostic/terminal `.log` artifacts raw-only |
+| Kimi CLI | `~/.kimi-code/sessions` (+ legacy `~/.kimi/sessions`) | append-preserving; `wire.jsonl` indexed (session-from-path), `kimi-code.log`/`output.log` raw-only |
 | pi | `~/.pi/agent/sessions` | append-preserving JSONL |
 | Google Antigravity | `~/.gemini/antigravity-cli/conversations` | **gated SQLite snapshot lane** — enable with `recall agy-enable` (WAL-safe online backup; archived, searchable via `--raw`; not yet parsed into the index) |
 
@@ -233,11 +233,31 @@ the source), content-hash dedupes generations — and ships disabled until a
 synthetic WAL canary proves all of that on your machine (`recall
 agy-enable`).
 
+## Regression verification
+
+The known false-corruption classes have hermetic guards that use temporary
+archives and temporary source copies only:
+
+```sh
+NODE_NO_WARNINGS=1 node scripts/verify-corruption-regressions.mjs
+NODE_NO_WARNINGS=1 node scripts/verify-corruption-negative-controls.mjs
+```
+
+The first command exercises real Grok, Kimi, and Codex parsing/indexing and
+prints `GUARD_PASS` only when raw logs stay out of the structured index,
+Codex compaction envelopes do not become gaps, and unrelated oversized
+records still do. The second command deliberately reintroduces each bug in a
+temporary copy and prints two `NEGATIVE_CONTROL_PASS` lines only when the
+first guard rejects both mutations for the expected reason.
+
 ## Known limitations (deliberate)
 
 - Lexical only; no embeddings (see gate above).
-- Pretty-printed JSON, unknown schemas, and oversized lines become counted
-  permanent gaps covered by `--raw` — not silently dropped, not indexed.
+- Pretty-printed JSON, unknown schemas, and unknown oversized records become
+  counted permanent gaps covered by `--raw` — not silently dropped, not
+  indexed. Recognized top-level Codex `compacted` envelopes are consumed
+  without a gap because they intentionally emit no searchable events; their
+  original bytes remain in the canonical archive and raw lane.
 - The archive is **preservation against vendor deletion, not a backup** —
   same disk, periodic capture (a session created and deleted between syncs
   can be missed). Pair with FileVault and your own encrypted backups.
