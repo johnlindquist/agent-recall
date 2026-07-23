@@ -69,7 +69,7 @@ recall propose-memory --json      stage a 30-minute proposal; writes no curated 
 recall remember --accept <id>     review a proposal; interactive terminal + exact SAVE required
 recall remember "<fact>" [--project|--global] [--]  # direct human-only path
 recall context                   curated facts (read-only for agents; stale facts flagged)
-recall forget "<text or id>"     retract a fact (file preserved, excluded from context)
+recall forget "<text or id>"     direct human-only retraction (file preserved)
 recall doctor                    health + per-source coverage + integrity checks
 recall agy-enable                enable the Antigravity snapshot lane (runs a WAL canary gate first)
 recall index [--rebuild] | archive | self-test
@@ -121,6 +121,10 @@ This does not add automatic extraction, session-end automation, fuzzy
 deduplication, bulk memory management, agent-side acceptance, background memory
 services, cross-machine sync, or automatic superseding. Humans can still use
 direct `recall remember "<fact>" [--project|--global]`.
+Direct `recall forget` is likewise interactive and human-only. Project facts
+are bound to collision-proof hashed project keys; older plain-basename project
+directories remain preserved on disk as unbound legacy data rather than being
+silently attributed to unrelated projects with the same basename.
 
 ## Why it's built this way
 

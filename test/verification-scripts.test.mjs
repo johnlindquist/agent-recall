@@ -91,3 +91,86 @@ test("installed verifier help is side-effect free", () => {
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.match(result.stdout, /^usage: verify-installed-recall/m);
 });
+
+function saveSkillFixture() {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "recall-save-proof-"));
+  const fixtureRepo = path.join(fixture, "repo");
+  const root = path.join(fixture, "installed");
+  const agentsSkills = path.join(fixture, "agents-skills");
+  const source = path.join(fixtureRepo, "integration", "agent-recall-save");
+  const installed = path.join(root, "integration", "agent-recall-save");
+  for (const dir of [
+    source,
+    path.join(source, "agents"),
+    installed,
+    path.join(installed, "agents"),
+    agentsSkills,
+  ]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(source, "SKILL.md"), "canonical skill\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(source, "agents", "openai.yaml"), "canonical metadata\n", { mode: 0o600 });
+  fs.copyFileSync(path.join(source, "SKILL.md"), path.join(installed, "SKILL.md"));
+  fs.copyFileSync(path.join(source, "agents", "openai.yaml"), path.join(installed, "agents", "openai.yaml"));
+  for (const dir of [installed, path.join(installed, "agents")]) fs.chmodSync(dir, 0o700);
+  for (const file of [path.join(installed, "SKILL.md"), path.join(installed, "agents", "openai.yaml")])
+    fs.chmodSync(file, 0o600);
+  const link = path.join(agentsSkills, "agent-recall-save");
+  fs.symlinkSync(installed, link);
+  const args = [
+    "--repo", fixtureRepo,
+    "--root", root,
+    "--agents-skills", agentsSkills,
+    "--skills-only",
+  ];
+  return { fixture, fixtureRepo, root, agentsSkills, source, installed, link, args };
+}
+
+test("installed verifier proves canonical save skill bytes, modes, and managed link", () => {
+  const fixture = saveSkillFixture();
+  try {
+    const result = runArgs("verify-installed-recall.mjs", fixture.args);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /^SAVE_SKILL_PASS files=2 link=/m);
+  } finally { fs.rmSync(fixture.fixture, { recursive: true, force: true }); }
+});
+
+test("installed verifier rejects save-skill byte, mode, checkout-link, and foreign-link drift", () => {
+  const cases = [
+    {
+      name: "altered bytes",
+      mutate: (f) => fs.writeFileSync(path.join(f.installed, "SKILL.md"), "changed\n"),
+      expected: /bytes differ/,
+    },
+    {
+      name: "wrong mode",
+      mutate: (f) => fs.chmodSync(path.join(f.installed, "agents", "openai.yaml"), 0o644),
+      expected: /mode mismatch/,
+    },
+    {
+      name: "checkout link",
+      mutate: (f) => {
+        fs.unlinkSync(f.link);
+        fs.symlinkSync(f.source, f.link);
+      },
+      expected: /link target mismatch/,
+    },
+    {
+      name: "foreign link",
+      mutate: (f) => {
+        const foreign = path.join(f.fixture, "foreign");
+        fs.mkdirSync(foreign);
+        fs.unlinkSync(f.link);
+        fs.symlinkSync(foreign, f.link);
+      },
+      expected: /link target mismatch/,
+    },
+  ];
+  for (const control of cases) {
+    const fixture = saveSkillFixture();
+    try {
+      control.mutate(fixture);
+      const result = runArgs("verify-installed-recall.mjs", fixture.args);
+      assert.notEqual(result.status, 0, `${control.name} unexpectedly passed`);
+      assert.match(result.stderr, control.expected, control.name);
+    } finally { fs.rmSync(fixture.fixture, { recursive: true, force: true }); }
+  }
+});

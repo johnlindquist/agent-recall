@@ -13,6 +13,6 @@ description: Search past agent conversations across Claude Code, Codex, Grok, Ki
 4. **Never write memory yourself** — never run any form of `recall remember`; it requires the user's interactive terminal and will refuse you. At a genuine task end, if something durable was decided or fixed, propose at most 2 candidates as final plain-text lines, not bullets or commands:
    `Memory candidate (project): We use Base UI, not Radix, in this app — evidence: package.json migration this session.`
    `Memory candidate (global): Prefer exact UTC dates in release notes.`
-   When the user explicitly asks to save or accept them, use `agent-recall-save`. In that requested flow only, `recall propose-memory --json` may stage a proposal; staging does not save memory.
+   When the user explicitly asks to save or accept them, use `agent-recall-save`. In that requested flow only, `recall propose-memory --json` may stage a proposal; staging does not save memory. Agents must never run `recall remember` or `recall forget`; both are interactive human-only curated-memory mutations.
 5. If recall output reports GAPS/STALE/DEGRADED or UNCOVERED sources, say so plainly — a degraded empty result does **not** mean "no history exists".
 6. `recall show <n>` expands a hit; `recall summary <n>` gives the session's opening ask + last answer. Hits print resume commands only when the session id validates and the CLI's resume syntax is known (some are labeled unverified).

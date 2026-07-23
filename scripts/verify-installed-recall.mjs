@@ -9,18 +9,23 @@ import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 
 process.umask(0o077);
-const USAGE = "usage: verify-installed-recall.mjs --repo <repository-root> --root <absolute RECALL_HOME> --wrapper <installed recall wrapper>";
+const USAGE = "usage: verify-installed-recall.mjs --repo <repository-root> --root <absolute RECALL_HOME> --wrapper <installed recall wrapper> [--agents-skills <absolute ~/.agents/skills>] [--skills-only]";
 
 function die(message) { throw new Error(String(message)); }
 function parseArgs(argv) {
   if (argv.includes("--help") || argv.includes("-h")) return { help: true };
   const out = {};
-  for (let i = 0; i < argv.length; i += 2) {
-    const key = argv[i], value = argv[i + 1];
-    if (!value || !new Set(["--repo", "--root", "--wrapper"]).has(key)) die(USAGE);
-    out[key.slice(2)] = value;
+  for (let i = 0; i < argv.length;) {
+    const key = argv[i++];
+    if (key === "--skills-only") { out.skillsOnly = true; continue; }
+    const value = argv[i++];
+    if (!value || !new Set(["--repo", "--root", "--wrapper", "--agents-skills"]).has(key)) die(USAGE);
+    out[key === "--agents-skills" ? "agentsSkills" : key.slice(2)] = value;
   }
-  for (const key of ["repo", "root", "wrapper"]) if (!out[key] || !path.isAbsolute(out[key])) die(`${key} must be an absolute path`);
+  for (const key of ["repo", "root"]) if (!out[key] || !path.isAbsolute(out[key])) die(`${key} must be an absolute path`);
+  if (!out.skillsOnly && (!out.wrapper || !path.isAbsolute(out.wrapper))) die("wrapper must be an absolute path");
+  out.agentsSkills ||= path.join(os.homedir(), ".agents", "skills");
+  if (!path.isAbsolute(out.agentsSkills)) die("agents-skills must be an absolute path");
   return out;
 }
 
@@ -49,6 +54,42 @@ function spawnChecked(command, args, options = {}) {
   return result;
 }
 
+function verifySaveSkill(args) {
+  const sourceDir = path.join(args.repo, "integration", "agent-recall-save");
+  const installedDir = path.join(args.root, "integration", "agent-recall-save");
+  const sourceSkill = path.join(sourceDir, "SKILL.md");
+  const sourceMetadata = path.join(sourceDir, "agents", "openai.yaml");
+  const installedSkill = path.join(installedDir, "SKILL.md");
+  const installedMetadataDir = path.join(installedDir, "agents");
+  const installedMetadata = path.join(installedMetadataDir, "openai.yaml");
+  for (const [source, installed] of [
+    [sourceSkill, installedSkill],
+    [sourceMetadata, installedMetadata],
+  ]) {
+    if (!fs.existsSync(installed) || shaFile(source) !== shaFile(installed))
+      die(`installed save-skill bytes differ: ${installed}`);
+    requireMode(installed, 0o600);
+  }
+  requireMode(installedDir, 0o700);
+  requireMode(installedMetadataDir, 0o700);
+
+  const managedLink = path.join(args.agentsSkills, "agent-recall-save");
+  let linkStat;
+  try { linkStat = fs.lstatSync(managedLink); }
+  catch { die(`managed save-skill link missing: ${managedLink}`); }
+  if (!linkStat.isSymbolicLink()) die(`managed save-skill path is not a symlink: ${managedLink}`);
+  const rawTarget = fs.readlinkSync(managedLink);
+  const resolvedTarget = path.resolve(path.dirname(managedLink), rawTarget);
+  if (resolvedTarget !== installedDir)
+    die(`managed save-skill link target mismatch: ${resolvedTarget} != ${installedDir}`);
+  if (fs.realpathSync(managedLink) !== fs.realpathSync(installedDir))
+    die("managed save-skill link does not resolve to canonical install");
+  if (shaFile(path.join(managedLink, "SKILL.md")) !== shaFile(sourceSkill) ||
+      shaFile(path.join(managedLink, "agents", "openai.yaml")) !== shaFile(sourceMetadata))
+    die("managed save-skill resolved bytes differ from source");
+  console.log(`SAVE_SKILL_PASS files=2 link=${managedLink}`);
+}
+
 async function verifyInstalled(args) {
   const pairs = [];
   for (const name of fs.readdirSync(path.join(args.repo, "lib")).filter((name) => name.endsWith(".mjs")).sort())
@@ -62,6 +103,7 @@ async function verifyInstalled(args) {
   }
   if ((fs.statSync(args.wrapper).mode & 0o111) === 0) die("installed wrapper is not executable");
   console.log(`INSTALLED_BYTES_PASS files=${pairs.length}`);
+  verifySaveSkill(args);
 
   const doctor = spawnChecked(args.wrapper, ["doctor"], { env: { ...process.env, RECALL_HOME: args.root } });
   const requiredDoctor = [/^ok\s+quick_check(?:\s|$)/m, /^ok\s+fts-consistency(?:\s|$)/m, /^ok\s+index gaps\s+—\s+\{\}$/m, /^ok\s+status\s+—\s+ok$/m];
@@ -112,6 +154,10 @@ async function verifyInstalled(args) {
 try {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) { console.log(USAGE); process.exit(0); }
+  if (args.skillsOnly) {
+    verifySaveSkill(args);
+    process.exit(0);
+  }
   await verifyInstalled(args);
 } catch (error) {
   console.error(`INSTALLED_RECALL_FAIL: ${String(error?.message ?? error).slice(0, 500)}`);

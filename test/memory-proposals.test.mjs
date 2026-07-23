@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 process.env.RECALL_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "recall-proposals-"));
@@ -12,6 +12,7 @@ const {
   PROPOSAL_TTL_MS,
   PROPOSAL_ID_RE,
   MAX_LIVE_PROPOSALS,
+  MAX_PROPOSAL_BYTES,
   parseCandidateBlock,
   parseProposalRequest,
   createMemoryProposal,
@@ -172,6 +173,49 @@ test("expired proposals fail closed and are removed by bounded cleanup", () => {
     now: now + PROPOSAL_TTL_MS,
   });
   assert.equal(fs.existsSync(path.join(MEMORY_PROPOSALS, receipt.proposalId + ".json")), false);
+});
+
+test("future-shifted and noncanonical timestamps fail closed", () => {
+  const now = Math.floor(Date.now() / 1000) * 1000;
+  const receipt = createMemoryProposal(parseProposalRequest(explicitRequest("future", "global")), { cwd, now });
+  const file = path.join(MEMORY_PROPOSALS, receipt.proposalId + ".json");
+  let value = JSON.parse(fs.readFileSync(file, "utf8"));
+  value.createdAt = new Date(now + 7 * 86400_000).toISOString();
+  value.expiresAt = new Date(now + 7 * 86400_000 + PROPOSAL_TTL_MS).toISOString();
+  fs.writeFileSync(file, JSON.stringify(value));
+  assert.throws(() => loadMemoryProposal(receipt.proposalId, { now }), /timestamps are invalid/);
+
+  fs.rmSync(MEMORY_PROPOSALS, { recursive: true, force: true });
+  const canonical = createMemoryProposal(parseProposalRequest(explicitRequest("noncanonical", "global")), { cwd, now });
+  const canonicalFile = path.join(MEMORY_PROPOSALS, canonical.proposalId + ".json");
+  value = JSON.parse(fs.readFileSync(canonicalFile, "utf8"));
+  value.createdAt = value.createdAt.replace(".000Z", "Z");
+  value.expiresAt = value.expiresAt.replace(".000Z", "Z");
+  fs.writeFileSync(canonicalFile, JSON.stringify(value));
+  assert.throws(() => loadMemoryProposal(canonical.proposalId, { now }), /timestamps are invalid/);
+});
+
+test("maximum JSON-expanding two-item payload stages and reloads exactly", () => {
+  const first = "\u0001".repeat(8000);
+  const second = "\u0002".repeat(8000);
+  const request = candidateRequest(
+    `Memory candidate (global): ${first}\nMemory candidate (global): ${second}`,
+  );
+  const encoded = JSON.stringify(request);
+  assert.ok(Buffer.byteLength(encoded) > 64 * 1024);
+  assert.ok(Buffer.byteLength(encoded) <= MAX_PROPOSAL_BYTES);
+  const result = spawnSync(process.execPath, [cli, "propose-memory", "--json"], {
+    cwd,
+    env: { ...process.env, RECALL_HOME: process.env.RECALL_HOME, NODE_NO_WARNINGS: "1" },
+    input: encoded,
+    encoding: "utf8",
+    maxBuffer: MAX_PROPOSAL_BYTES * 2,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(result.stdout);
+  const loaded = loadMemoryProposal(receipt.proposalId);
+  assert.equal(loaded.items[0].fact, first);
+  assert.equal(loaded.items[1].fact, second);
 });
 
 test("corrupt, hash-mismatched, wrong-version, and symlink proposals fail closed", () => {

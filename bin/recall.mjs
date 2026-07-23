@@ -446,12 +446,12 @@ function readTerminalLine(prompt) {
   return Buffer.from(bytes).toString("utf8");
 }
 
-function requireInteractiveRemember() {
+function requireInteractiveMemoryMutation() {
   // A25: memory writes are human-only — require an interactive terminal so a
   // prompt-injected agent cannot persist facts non-interactively. (Same-UID
   // malware remains out of scope; this blocks the confused-deputy path.)
   if (!process.stdin.isTTY) {
-    console.error("recall remember requires an interactive terminal (agents propose; humans save)");
+    console.error("curated memory mutation requires an interactive terminal (agents read/propose; humans change memory)");
     process.exit(77);
   }
 }
@@ -489,7 +489,7 @@ function verifyProposalProject(project) {
 function cmdAcceptProposal(args) {
   if (args.length !== 2 || args[0] !== "--accept" || !proposals.PROPOSAL_ID_RE.test(args[1] || ""))
     throw new UsageError("usage: recall remember --accept <32-character proposal id>");
-  requireInteractiveRemember();
+  requireInteractiveMemoryMutation();
   const proposal = proposals.loadMemoryProposal(args[1]);
   verifyProposalProject(proposal.project);
 
@@ -554,43 +554,79 @@ function cmdAcceptProposal(args) {
   if (confirmation !== "SAVE") { console.log("cancelled; nothing written and proposal kept"); return; }
 
   return proposals.withProposalAcceptanceLock(args[1], () =>
-    memory.withMemoryWriteLock(({ rememberIfAbsentAtTarget }) => {
-      // Lock order is proposal acceptance -> global memory write. Revalidate
-      // only after both are owned, then use one immutable project target for
-      // duplicate lookup and every write.
+    memory.withMemoryWriteLock(({ findActiveDuplicateAtTarget, rememberAtTarget }) => {
+      // Lock order is proposal acceptance -> memory write -> proposal store.
+      // Recompute the reviewed memory state under the write lock before
+      // forming a fixed plan; no duplicate scan occurs after the commit point.
       const fresh = proposals.loadMemoryProposal(args[1], { now: Date.now() });
       if (JSON.stringify(fresh) !== JSON.stringify(proposal))
         throw new Error("proposal changed after preview");
-      const projectTarget = verifyProposalProject(fresh.project);
-      // Project verification can run Git; perform one final immediate expiry
-      // check before any write while both locks remain held.
-      const writeSnapshot = proposals.loadMemoryProposal(args[1], { now: Date.now() });
-      if (JSON.stringify(writeSnapshot) !== JSON.stringify(fresh))
-        throw new Error("proposal changed at write boundary");
-
-      const receipts = [];
-      for (const [index, item] of resolved.entries()) {
-        const freshItem = writeSnapshot.items[index];
-        if (!freshItem || freshItem.fact !== item.fact || freshItem.sha256 !== item.sha256 ||
-            (freshItem.scope !== null && freshItem.scope !== item.scope))
-          throw new Error(`proposal item ${index + 1} changed after preview`);
-        try {
-          const result = rememberIfAbsentAtTarget(
-            item.fact,
-            item.project ? projectTarget : null,
-          );
-          if (result.action === "existing")
-            receipts.push(`already active scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
-          else
-            receipts.push(`remembered scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
-        } catch (error) {
-          for (const receipt of receipts) console.log(receipt);
-          console.error(`item ${index + 1} failed: ${error?.message || error}`);
-          throw new Error("proposal partially applied; proposal kept for an idempotent retry");
-        }
+      const target = fresh.project ? Object.freeze({ ...fresh.project }) : null;
+      const lockedState = [];
+      const reviewSignature = (item) => item.duplicate
+        ? `active:${item.duplicate.scope}:${item.duplicate.id}`
+        : item.pendingDuplicateOf ? `same-proposal:${item.pendingDuplicateOf}` : "none";
+      for (const item of resolved) {
+        const duplicate = findActiveDuplicateAtTarget(
+          item.fact,
+          item.project ? target : null,
+        );
+        const pendingDuplicateOf = lockedState.findIndex((prior) =>
+          prior.scope === item.scope && prior.fact === item.fact);
+        const current = {
+          ...item,
+          duplicate,
+          pendingDuplicateOf: pendingDuplicateOf >= 0 ? pendingDuplicateOf + 1 : null,
+        };
+        if (reviewSignature(current) !== reviewSignature(item))
+          throw new Error("memory state changed after preview; review again (proposal kept)");
+        lockedState.push(current);
       }
-      proposals.removeMemoryProposal(args[1]);
-      for (const receipt of receipts) console.log(receipt);
+
+      return proposals.withProposalStoreLock(() => {
+        // The store lock prevents expiry cleanup from deleting this proposal
+        // between validation, writes, and consumption.
+        const storeSnapshot = proposals.loadMemoryProposal(args[1], { now: Date.now() });
+        if (JSON.stringify(storeSnapshot) !== JSON.stringify(fresh))
+          throw new Error("proposal changed at write boundary");
+        const projectTarget = verifyProposalProject(storeSnapshot.project);
+        const writeSnapshot = proposals.loadMemoryProposal(args[1], { now: Date.now() });
+        if (JSON.stringify(writeSnapshot) !== JSON.stringify(storeSnapshot))
+          throw new Error("proposal changed at commit boundary");
+
+        const receipts = [];
+        const results = [];
+        for (const [index, item] of lockedState.entries()) {
+          const freshItem = writeSnapshot.items[index];
+          if (!freshItem || freshItem.fact !== item.fact || freshItem.sha256 !== item.sha256 ||
+              (freshItem.scope !== null && freshItem.scope !== item.scope))
+            throw new Error(`proposal item ${index + 1} changed after preview`);
+          try {
+            let result;
+            if (item.duplicate) result = { action: "existing", ...item.duplicate };
+            else if (item.pendingDuplicateOf) {
+              const prior = results[item.pendingDuplicateOf - 1];
+              result = { ...prior, action: "existing" };
+            } else {
+              result = {
+                action: "remembered",
+                ...rememberAtTarget(item.fact, item.project ? projectTarget : null),
+              };
+            }
+            results.push(result);
+            if (result.action === "existing")
+              receipts.push(`already active scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
+            else
+              receipts.push(`remembered scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
+          } catch (error) {
+            for (const receipt of receipts) console.log(receipt);
+            console.error(`item ${index + 1} failed: ${error?.message || error}`);
+            throw new Error("proposal partially applied; proposal kept for an idempotent retry");
+          }
+        }
+        proposals.removeMemoryProposal(args[1]);
+        for (const receipt of receipts) console.log(receipt);
+      });
     }),
   );
 }
@@ -620,15 +656,15 @@ function parseLegacyRemember(args) {
 function cmdRemember(args) {
   if (args[0] === "--accept") return cmdAcceptProposal(args);
   const { fact, project } = parseLegacyRemember(args);
-  requireInteractiveRemember();
+  requireInteractiveMemoryMutation();
   const r = memory.remember(fact, { project });
-  console.log(`remembered ${r.scope} id=${r.id}: ${oneLine(fact).slice(0, 80)}`);
+  console.log(`remembered scope=${terminalSafeJson(r.scope)} id=${terminalSafeJson(r.id)}: ${oneLine(fact).slice(0, 80)}`);
 }
 
 function cmdProposeMemory(args) {
   if (args.length !== 1 || args[0] !== "--json")
     throw new UsageError("usage: recall propose-memory --json");
-  const request = proposals.parseProposalRequest(readBoundedStdin());
+  const request = proposals.parseProposalRequest(readBoundedStdin(proposals.MAX_PROPOSAL_BYTES));
   const receipt = proposals.createMemoryProposal(request);
   console.log(JSON.stringify(receipt));
 }
@@ -637,15 +673,16 @@ function cmdContext(args) {
   const facts = memory.contextFacts({});
   if (args.includes("--json")) { console.log(JSON.stringify(facts)); return; }
   if (!facts.length) { console.log('(no stored facts — add with: recall remember "...")'); return; }
-  for (const f of facts) console.log(`- [${f.scope}]${f.stale ? " [verify: >180d]" : ""} ${tl(f.fact.split("\n")[0]).slice(0, 200)}`);
+  for (const f of facts) console.log(`- [scope=${terminalSafeJson(f.scope)}]${f.stale ? " [verify: >180d]" : ""} ${tl(f.fact.split("\n")[0]).slice(0, 200)}`);
 }
 
 function cmdForget(args) {
   const match = args.join(" ").trim();
   if (!match) throw new UsageError('usage: recall forget "<text or id>"');
+  requireInteractiveMemoryMutation();
   const r = memory.forget(match);
-  if (r.action === "retracted") console.log(`retracted: ${r.id} (file preserved; excluded from context)`);
-  else if (r.action === "ambiguous") { console.log("multiple matches — re-run with the id:"); for (const c of r.candidates) console.log(`  ${c.id} — ${oneLine(c.fact)}`); }
+  if (r.action === "retracted") console.log(`retracted id=${terminalSafeJson(r.id)} (file preserved; excluded from context)`);
+  else if (r.action === "ambiguous") { console.log("multiple matches — re-run with the id:"); for (const c of r.candidates) console.log(`  id=${terminalSafeJson(c.id)} — ${oneLine(c.fact)}`); }
   else console.log("no active fact matches");
 }
 

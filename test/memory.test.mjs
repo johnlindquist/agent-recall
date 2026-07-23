@@ -32,7 +32,7 @@ test("remember writes global and project facts with frontmatter", () => {
   assert.equal(p.scope, `project:${base}`);
   assert.ok(p.file.includes(path.join("projects", dirKey, "facts")));
   const raw = fs.readFileSync(p.file, "utf8");
-  for (const re of [/^id: /m, /^created: /m, /^scope: project:/m, /^status: active$/m, /^provenance: human-cli$/m])
+  for (const re of [/^id: /m, /^created: /m, /^scope: project$/m, new RegExp(`^project_key: ${dirKey}$`, "m"), /^status: active$/m, /^provenance: human-cli$/m])
     assert.match(raw, re);
 });
 
@@ -117,16 +117,54 @@ test("forget by full id works after ambiguity", () => {
   assert.deepEqual(r, { action: "retracted", id: tabs.id });
 });
 
-test("legacy plain-basename project dir stays readable (migration compat)", () => {
+test("legacy plain-basename project data stays preserved but unbound", () => {
   const legacyDir = path.join(MEMORY, "projects", base, "facts");
   fs.mkdirSync(legacyDir, { recursive: true });
   fs.writeFileSync(path.join(legacyDir, "legacy-fact.md"),
     `---\nid: legacy-fact\ncreated: 2026-01-01T00:00:00.000Z\nscope: project:${base}\nstatus: active\nprovenance: human-cli\n---\n\nLegacy migration note about deployment\n`);
   const hit = contextFacts({ cwd }).find((f) => f.fact.includes("Legacy migration note"));
-  assert.ok(hit, "legacy-dir fact must surface in contextFacts");
-  assert.equal(hit.id, "legacy-fact");
-  // forget reaches into the legacy dir too
-  assert.deepEqual(forget("legacy migration note", { cwd }), { action: "retracted", id: "legacy-fact" });
+  assert.equal(hit, undefined, "legacy basename data must not bind to a current project");
+  assert.equal(findActiveDuplicate("Legacy migration note about deployment", { project: true, cwd }), null);
+  assert.deepEqual(forget("legacy migration note", { cwd }), { action: "none" });
+  assert.match(fs.readFileSync(path.join(legacyDir, "legacy-fact.md"), "utf8"), /^status: active$/m);
+});
+
+test("same-basename projects and dirKey-like basenames cannot alias", () => {
+  const parentA = fs.mkdtempSync(path.join(os.tmpdir(), "recall-client-a-"));
+  const parentB = fs.mkdtempSync(path.join(os.tmpdir(), "recall-client-b-"));
+  const apiA = path.join(parentA, "api");
+  const apiB = path.join(parentB, "api");
+  fs.mkdirSync(apiA);
+  fs.mkdirSync(apiB);
+  const fact = "same basename isolation fact";
+  const written = remember(fact, { project: true, cwd: apiA });
+  assert.equal(findActiveDuplicate(fact, { project: true, cwd: apiB }), null);
+  assert.ok(!contextFacts({ cwd: apiB }).some((item) => item.fact === fact));
+  assert.deepEqual(forget(fact, { cwd: apiB }), { action: "none" });
+  assert.match(fs.readFileSync(written.file, "utf8"), /^status: active$/m);
+
+  const keyLike = path.join(parentB, projectKey(apiA).dirKey);
+  fs.mkdirSync(keyLike);
+  assert.equal(findActiveDuplicate(fact, { project: true, cwd: keyLike }), null);
+  assert.ok(!contextFacts({ cwd: keyLike }).some((item) => item.fact === fact));
+});
+
+test("project keys bound hostile and maximum-length basenames safely", () => {
+  const hostile = fs.mkdtempSync(path.join(os.tmpdir(), "scope\n---\n\u0085\u061c-"));
+  const hostileResult = remember("hostile project metadata fact", { project: true, cwd: hostile });
+  const raw = fs.readFileSync(hostileResult.file, "utf8");
+  assert.match(raw, /^scope: project$/m);
+  assert.match(raw, /^project_key: [a-z0-9-]+-[a-f0-9]{10}$/m);
+  assert.equal((raw.match(/^---$/gm) || []).length, 2);
+  assert.equal(findActiveDuplicate("hostile project metadata fact", { project: true, cwd: hostile })?.id, hostileResult.id);
+
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "recall-long-parent-"));
+  const longProject = path.join(parent, "x".repeat(245));
+  fs.mkdirSync(longProject);
+  const key = projectKey(longProject).dirKey;
+  assert.ok(Buffer.byteLength(key) <= 255);
+  const longResult = remember("long basename fact", { project: true, cwd: longProject });
+  assert.ok(fs.existsSync(longResult.file));
 });
 
 test("remember survives id collisions (same ms, same fact) via wx retry with random suffix", () => {

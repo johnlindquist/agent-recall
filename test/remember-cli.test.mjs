@@ -93,6 +93,22 @@ function holdMemoryWriteLock(root) {
   return () => fs.rmSync(lock, { recursive: true, force: true });
 }
 
+function ttyForget(root, match, cwd = repo) {
+  const script = [
+    "set timeout 15",
+    "log_user 1",
+    "spawn env RECALL_HOME=$env(RECALL_HOME) NODE_NO_WARNINGS=1 $env(TEST_NODE) $env(TEST_CLI) forget $env(TEST_MATCH)",
+    "expect eof",
+    "catch wait result",
+    "exit [lindex $result 3]",
+  ].join("; ");
+  return spawnSync("/usr/bin/expect", ["-c", script], {
+    cwd,
+    env: envFor(root, { TEST_NODE: node, TEST_CLI: cli, TEST_MATCH: match }),
+    encoding: "utf8",
+  });
+}
+
 const explicit = (text, scope = null) => ({
   schemaVersion: 1,
   mode: "explicit",
@@ -221,6 +237,22 @@ test("expired and corrupt proposals fail closed in a real TTY", () => {
   assert.equal(fs.existsSync(path.join(root, "memory")), false);
 });
 
+test("future-shifted proposal timestamps write nothing and retain the proposal", () => {
+  const root = fresh("recall-cli-future-proposal-");
+  const receipt = stage(root, explicit("future proposal must fail", "global"));
+  const file = path.join(root, "state/memory-proposals", receipt.proposalId + ".json");
+  const value = JSON.parse(fs.readFileSync(file, "utf8"));
+  const future = Date.now() + 7 * 86400_000;
+  value.createdAt = new Date(future).toISOString();
+  value.expiresAt = new Date(future + 30 * 60 * 1000).toISOString();
+  fs.writeFileSync(file, JSON.stringify(value));
+  const result = ttyRun(root, receipt.proposalId);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout + result.stderr, /proposal timestamps are invalid/);
+  assert.equal(fs.existsSync(path.join(root, "memory")), false);
+  assert.ok(fs.existsSync(file));
+});
+
 test("proposal that expires at the SAVE prompt writes nothing", () => {
   const root = fresh("recall-cli-expiry-boundary-");
   const receipt = stage(root, explicit("must expire before SAVE", "global"));
@@ -299,8 +331,63 @@ test("concurrent proposals with the same scoped fact remain idempotent", async (
     ttyRunAsync(root, first.proposalId, exchange),
     ttyRunAsync(root, second.proposalId, exchange),
   ]);
-  assert.ok(results.every((result) => result.status === 0), results.map((r) => r.stderr + r.stdout).join("\n"));
+  assert.equal(results.filter((result) => result.status === 0).length, 1);
+  const changed = results.find((result) => result.status !== 0);
+  assert.match(changed.stdout + changed.stderr, /memory state changed after preview/);
+  assert.equal(
+    [first, second].filter((receipt) =>
+      fs.existsSync(path.join(root, "state/memory-proposals", receipt.proposalId + ".json"))).length,
+    1,
+  );
   assert.equal(fs.readdirSync(path.join(root, "memory/global/facts")).length, 1);
+});
+
+test("duplicate state changed after preview aborts with zero new writes", async () => {
+  const root = fresh("recall-cli-duplicate-drift-");
+  const first = stage(root, explicit("reviewed duplicate state", "global"));
+  assert.equal(ttyRun(root, first.proposalId, [{ expect: "Type SAVE", send: "SAVE" }]).status, 0);
+  const factsDir = path.join(root, "memory/global/facts");
+  const existingFile = path.join(factsDir, fs.readdirSync(factsDir)[0]);
+  const second = stage(root, explicit("reviewed duplicate state", "global"));
+  const release = holdMemoryWriteLock(root);
+  let changed = false;
+  const resultPromise = ttyRunAsync(root, second.proposalId, [
+    { expect: "Type SAVE", send: "SAVE" },
+  ], repo, (chunk) => {
+    if (!changed && chunk.includes("Type SAVE")) {
+      changed = true;
+      const raw = fs.readFileSync(existingFile, "utf8");
+      fs.writeFileSync(existingFile, raw.replace(/^status: active$/m, "status: retracted"));
+      release();
+    }
+  });
+  const result = await resultPromise;
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout + result.stderr, /memory state changed after preview; review again/);
+  assert.equal(fs.readdirSync(factsDir).length, 1);
+  assert.ok(fs.existsSync(path.join(root, "state/memory-proposals", second.proposalId + ".json")));
+});
+
+test("concurrent expiry cleanup cannot produce a write plus failure", async () => {
+  const root = fresh("recall-cli-expiry-cleanup-");
+  const receipt = stage(root, explicit("no mixed write cleanup outcome", "global"));
+  const file = path.join(root, "state/memory-proposals", receipt.proposalId + ".json");
+  const value = JSON.parse(fs.readFileSync(file, "utf8"));
+  const expires = Date.now() + 1_200;
+  value.expiresAt = new Date(expires).toISOString();
+  value.createdAt = new Date(expires - 30 * 60 * 1000).toISOString();
+  fs.writeFileSync(file, JSON.stringify(value));
+  const release = holdMemoryWriteLock(root);
+  const acceptPromise = ttyRunAsync(root, receipt.proposalId, [
+    { expect: "Type SAVE", send: "SAVE" },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 1_600));
+  const staged = stage(root, explicit("cleanup trigger", "global"));
+  release();
+  const result = await acceptPromise;
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.existsSync(path.join(root, "memory")), false);
+  assert.ok(fs.existsSync(path.join(root, "state/memory-proposals", staged.proposalId + ".json")));
 });
 
 test("terminal review losslessly escapes hostile project and fact characters", () => {
@@ -318,6 +405,24 @@ test("terminal review losslessly escapes hostile project and fact characters", (
   assert.match(result.stdout, /\\nsha256=FORGED\\u202e\\u061c/);
   assert.match(result.stdout, /\\u2028sha256=FAKE\\u202e\\u0085\\u061ctail/);
   assert.equal((result.stdout.match(/^\s*sha256=[a-f0-9]{64}\r?$/gm) || []).length, 1);
+  const factFiles = fs.readdirSync(path.join(root, "memory/projects"), { recursive: true })
+    .filter((name) => name.endsWith(".md"));
+  assert.equal(factFiles.length, 1);
+  const stored = fs.readFileSync(path.join(root, "memory/projects", factFiles[0]), "utf8");
+  assert.equal((stored.match(/^---$/gm) || []).length, 2);
+  assert.match(stored, /^scope: project$/m);
+  assert.match(stored, /^project_key: [a-z0-9-]+-[a-f0-9]{10}$/m);
+  assert.ok(stored.endsWith(hostileFact + "\n"));
+
+  const again = stage(root, explicit(hostileFact, "project"), project);
+  const duplicate = ttyRun(root, again.proposalId, [{ expect: "Type SAVE", send: "SAVE" }], project);
+  assert.equal(duplicate.status, 0, duplicate.stderr + duplicate.stdout);
+  assert.match(duplicate.stdout, /already active scope=/);
+  assert.equal(
+    fs.readdirSync(path.join(root, "memory/projects"), { recursive: true })
+      .filter((name) => name.endsWith(".md")).length,
+    1,
+  );
 });
 
 test("project acceptance is bound to the staged project and fails if it disappears", () => {
@@ -416,4 +521,23 @@ test("mid-batch failure keeps the proposal and retry does not duplicate the firs
   assert.equal(fs.readdirSync(projectFacts, { recursive: true }).filter((name) => name.endsWith(".md")).length, 1);
   assert.equal(fs.readdirSync(globalDir).filter((name) => name.endsWith(".md")).length, 1);
   assert.equal(fs.existsSync(proposalFile), false);
+});
+
+test("forget is non-TTY blocked and real-TTY human retraction still works", () => {
+  const root = fresh("recall-cli-forget-tty-");
+  const receipt = stage(root, explicit("human-only forget fact", "global"));
+  assert.equal(ttyRun(root, receipt.proposalId, [{ expect: "Type SAVE", send: "SAVE" }]).status, 0);
+  const factsDir = path.join(root, "memory/global/facts");
+  const file = path.join(factsDir, fs.readdirSync(factsDir)[0]);
+  const before = fs.readFileSync(file);
+  for (const env of [{}, { RECALL_ALLOW_NONTTY_REMEMBER: "1" }]) {
+    const blocked = run(root, ["forget", "human-only forget fact"], { env });
+    assert.equal(blocked.status, 77);
+    assert.match(blocked.stderr, /interactive terminal/);
+    assert.deepEqual(fs.readFileSync(file), before);
+  }
+  const retracted = ttyForget(root, "human-only forget fact");
+  assert.equal(retracted.status, 0, retracted.stderr + retracted.stdout);
+  assert.match(retracted.stdout, /retracted id=/);
+  assert.match(fs.readFileSync(file, "utf8"), /^status: retracted$/m);
 });
