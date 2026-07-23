@@ -31,8 +31,12 @@ function parseArgs(argv) {
 
 function shaFile(fp) {
   const hash = crypto.createHash("sha256");
-  const fd = fs.openSync(fp, "r");
+  const lst = fs.lstatSync(fp);
+  if (!lst.isFile() || lst.isSymbolicLink()) die(`not a real regular file: ${fp}`);
+  const fd = fs.openSync(fp, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
   try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) die(`not a regular file: ${fp}`);
     const buf = Buffer.alloc(1024 * 1024);
     for (let pos = 0; ; ) {
       const n = fs.readSync(fd, buf, 0, buf.length, pos);
@@ -44,8 +48,16 @@ function shaFile(fp) {
 }
 
 function requireMode(fp, expected) {
-  const mode = fs.statSync(fp).mode & 0o777;
+  const st = fs.lstatSync(fp);
+  if (st.isSymbolicLink()) die(`symlink not allowed: ${fp}`);
+  const mode = st.mode & 0o777;
   if (mode !== expected) die(`mode mismatch ${fp}: ${mode.toString(8)} != ${expected.toString(8)}`);
+}
+
+function requireRealDir(fp) {
+  const st = fs.lstatSync(fp);
+  if (!st.isDirectory() || st.isSymbolicLink()) die(`not a real directory: ${fp}`);
+  requireMode(fp, 0o700);
 }
 
 function spawnChecked(command, args, options = {}) {
@@ -62,6 +74,8 @@ function verifySaveSkill(args) {
   const installedSkill = path.join(installedDir, "SKILL.md");
   const installedMetadataDir = path.join(installedDir, "agents");
   const installedMetadata = path.join(installedMetadataDir, "openai.yaml");
+  for (const dir of [args.root, path.join(args.root, "integration"), installedDir, installedMetadataDir])
+    requireRealDir(dir);
   for (const [source, installed] of [
     [sourceSkill, installedSkill],
     [sourceMetadata, installedMetadata],
@@ -69,9 +83,13 @@ function verifySaveSkill(args) {
     if (!fs.existsSync(installed) || shaFile(source) !== shaFile(installed))
       die(`installed save-skill bytes differ: ${installed}`);
     requireMode(installed, 0o600);
+    if (fs.lstatSync(installed).nlink !== 1) die(`installed save-skill file is hard-linked: ${installed}`);
   }
-  requireMode(installedDir, 0o700);
-  requireMode(installedMetadataDir, 0o700);
+  const rootEntries = fs.readdirSync(installedDir).sort();
+  const metadataEntries = fs.readdirSync(installedMetadataDir).sort();
+  if (JSON.stringify(rootEntries) !== JSON.stringify(["SKILL.md", "agents"]) ||
+      JSON.stringify(metadataEntries) !== JSON.stringify(["openai.yaml"]))
+    die("unexpected entry in canonical save-skill tree");
 
   const managedLink = path.join(args.agentsSkills, "agent-recall-save");
   let linkStat;
@@ -87,6 +105,19 @@ function verifySaveSkill(args) {
   if (shaFile(path.join(managedLink, "SKILL.md")) !== shaFile(sourceSkill) ||
       shaFile(path.join(managedLink, "agents", "openai.yaml")) !== shaFile(sourceMetadata))
     die("managed save-skill resolved bytes differ from source");
+  for (const name of fs.readdirSync(args.agentsSkills)) {
+    if (name === "agent-recall-save") continue;
+    const candidate = path.join(args.agentsSkills, name);
+    let st;
+    try { st = fs.lstatSync(candidate); } catch { continue; }
+    if (!st.isSymbolicLink()) continue;
+    try {
+      if (fs.realpathSync(candidate) === fs.realpathSync(installedDir))
+        die(`unexpected save-skill alias: ${candidate}`);
+    } catch (error) {
+      if (/unexpected save-skill alias/.test(error?.message || "")) throw error;
+    }
+  }
   console.log(`SAVE_SKILL_PASS files=2 link=${managedLink}`);
 }
 

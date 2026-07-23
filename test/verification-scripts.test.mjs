@@ -163,6 +163,44 @@ test("installed verifier rejects save-skill byte, mode, checkout-link, and forei
       },
       expected: /link target mismatch/,
     },
+    {
+      name: "symlinked canonical directory",
+      mutate: (f) => {
+        const foreign = path.join(f.fixture, "foreign-save");
+        fs.renameSync(f.installed, foreign);
+        fs.symlinkSync(foreign, f.installed);
+      },
+      expected: /not a real directory/,
+    },
+    {
+      name: "symlinked metadata directory",
+      mutate: (f) => {
+        const agents = path.join(f.installed, "agents");
+        const foreign = path.join(f.fixture, "foreign-agents");
+        fs.renameSync(agents, foreign);
+        fs.symlinkSync(foreign, agents);
+      },
+      expected: /not a real directory/,
+    },
+    {
+      name: "hard-linked installed file",
+      mutate: (f) => {
+        const installedSkill = path.join(f.installed, "SKILL.md");
+        fs.unlinkSync(installedSkill);
+        fs.linkSync(path.join(f.source, "SKILL.md"), installedSkill);
+      },
+      expected: /hard-linked/,
+    },
+    {
+      name: "unexpected installed file",
+      mutate: (f) => fs.writeFileSync(path.join(f.installed, "EXTRA"), "extra\n"),
+      expected: /unexpected entry/,
+    },
+    {
+      name: "extra alias",
+      mutate: (f) => fs.symlinkSync(f.installed, path.join(f.agentsSkills, "accept-memories")),
+      expected: /unexpected save-skill alias/,
+    },
   ];
   for (const control of cases) {
     const fixture = saveSkillFixture();

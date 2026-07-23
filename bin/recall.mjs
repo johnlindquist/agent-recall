@@ -417,7 +417,11 @@ function readBoundedStdin(maxBytes = 64 * 1024) {
     if (total > maxBytes) throw new UsageError(`stdin exceeds ${maxBytes} bytes`);
     chunks.push(Buffer.from(buf.subarray(0, count)));
   }
-  return Buffer.concat(chunks).toString("utf8");
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+  } catch {
+    throw new UsageError("stdin is not valid UTF-8");
+  }
 }
 
 function readTerminalLine(prompt) {
@@ -477,10 +481,20 @@ function verifyProposalProject(project) {
   let currentTop;
   try { currentTop = fs.realpathSync(current.top); }
   catch { throw new Error("proposal project identity cannot be verified"); }
-  if (currentTop !== project.top || current.base !== project.base || current.dirKey !== project.dirKey)
+  if (currentTop !== project.top ||
+      current.kind !== project.kind ||
+      current.gitDir !== project.gitDir ||
+      current.dev !== project.dev ||
+      current.ino !== project.ino ||
+      current.base !== project.base ||
+      current.dirKey !== project.dirKey)
     throw new Error("proposal project identity has changed");
   return Object.freeze({
+    kind: project.kind,
     top: project.top,
+    gitDir: project.gitDir,
+    dev: project.dev,
+    ino: project.ino,
     base: project.base,
     dirKey: project.dirKey,
   });
@@ -624,8 +638,15 @@ function cmdAcceptProposal(args) {
             throw new Error("proposal partially applied; proposal kept for an idempotent retry");
           }
         }
-        proposals.removeMemoryProposal(args[1]);
         for (const receipt of receipts) console.log(receipt);
+        try {
+          proposals.removeMemoryProposal(args[1]);
+        } catch (error) {
+          // The applied writes and explicit receipts are the success boundary.
+          // A retained proposal is safe to retry: strict duplicate detection
+          // reports the already-active facts and retries cleanup.
+          console.error(`memory applied; proposal cleanup deferred: ${error?.message || error}`);
+        }
       });
     }),
   );
@@ -900,7 +921,7 @@ async function cmdSelfTest() {
   const cov = coverage(db);
   assert("coverage reports selftest source", !!cov.perSource.selftest && cov.perSource.selftest.events > 0);
   const proposalRequest = proposals.parseProposalRequest({
-    schemaVersion: 1,
+    schemaVersion: 2,
     mode: "explicit",
     text: "self-test proposal exact — evidence: isolated self-test",
     scope: "global",

@@ -24,13 +24,13 @@ const { MEMORY_PROPOSALS, MEMORY } = await import("../lib/paths.mjs");
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "recall-proposal-project-"));
 const cli = fileURLToPath(new URL("../bin/recall.mjs", import.meta.url));
 const candidateRequest = (text, scopeOverride = null) => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   mode: "candidates",
   text,
   scopeOverride,
 });
 const explicitRequest = (text, scope = null) => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   mode: "explicit",
   text,
   scope,
@@ -88,15 +88,29 @@ test("strict request schema preserves explicit text and applies only explicit sc
 test("strict request schema rejects unknown keys, modes, versions, scopes, empties, and oversized facts", () => {
   const bad = [
     { ...explicitRequest("x"), extra: true },
-    { ...explicitRequest("x"), schemaVersion: 2 },
+    { ...explicitRequest("x"), schemaVersion: 3 },
     { ...explicitRequest("x"), mode: "automatic" },
     explicitRequest("x", "other"),
     explicitRequest("  ", "global"),
     explicitRequest("x".repeat(8001), "global"),
-    { schemaVersion: 1, mode: "candidates", text: "Memory candidate: x" },
+    { schemaVersion: 2, mode: "candidates", text: "Memory candidate: x" },
   ];
   for (const value of bad) assert.throws(() => parseProposalRequest(value));
   assert.throws(() => parseProposalRequest("{not json"));
+  assert.throws(() => parseProposalRequest(explicitRequest("\ud800", "global")), /unpaired surrogate/);
+});
+
+test("CLI rejects malformed UTF-8 before creating a proposal", () => {
+  const before = fs.existsSync(MEMORY_PROPOSALS) ? fs.readdirSync(MEMORY_PROPOSALS) : [];
+  const result = spawnSync(process.execPath, [cli, "propose-memory", "--json"], {
+    cwd,
+    env: { ...process.env, RECALL_HOME: process.env.RECALL_HOME, NODE_NO_WARNINGS: "1" },
+    input: Buffer.from([0x7b, 0x22, 0x80, 0x22, 0x7d]),
+    maxBuffer: 1024 * 1024,
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr.toString(), /stdin is not valid UTF-8/);
+  assert.deepEqual(fs.existsSync(MEMORY_PROPOSALS) ? fs.readdirSync(MEMORY_PROPOSALS) : [], before);
 });
 
 test("proposal creation is outside memory, writes no fact, and returns a false-win receipt", () => {

@@ -19,9 +19,9 @@ test("projectKey falls back to cwd outside git; variants include pi double-hyphe
   assert.ok(pk.list[1].startsWith("-") && !pk.list[1].includes("/"));
   assert.equal(pk.list[2], `-${pk.list[1]}-`);
   assert.equal(pk.list[3], `-${pk.list[1]}--`); // pi historical double-trailing-hyphen form
-  // dirKey = slug(base) + 10-char toplevel hash: basename collisions can't share a dir
-  assert.match(pk.dirKey, /^[a-z0-9][a-z0-9-]*-[0-9a-f]{10}$/);
-  assert.ok(pk.dirKey.startsWith(pk.base.toLowerCase().replace(/[^a-z0-9]+/g, "-")));
+  assert.match(pk.dirKey, /^v2-[0-9a-f]{64}$/);
+  assert.equal(pk.kind, "plain");
+  assert.equal(pk.gitDir, null);
 });
 
 test("remember writes global and project facts with frontmatter", () => {
@@ -154,7 +154,7 @@ test("project keys bound hostile and maximum-length basenames safely", () => {
   const hostileResult = remember("hostile project metadata fact", { project: true, cwd: hostile });
   const raw = fs.readFileSync(hostileResult.file, "utf8");
   assert.match(raw, /^scope: project$/m);
-  assert.match(raw, /^project_key: [a-z0-9-]+-[a-f0-9]{10}$/m);
+  assert.match(raw, /^project_key: v2-[a-f0-9]{64}$/m);
   assert.equal((raw.match(/^---$/gm) || []).length, 2);
   assert.equal(findActiveDuplicate("hostile project metadata fact", { project: true, cwd: hostile })?.id, hostileResult.id);
 
@@ -183,4 +183,34 @@ test("global remember works even without a usable cwd (git/projectKey skipped)",
   const r = remember("global no-cwd fact", { cwd: "/definitely/not/a/dir" });
   assert.equal(r.scope, "global");
   assert.ok(fs.existsSync(r.file));
+});
+
+test("mutation-time scans fail closed on unreadable, malformed, and symlink facts", {
+  skip: process.platform === "win32",
+}, () => {
+  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "recall-strict-store-"));
+  const result = remember("strict store original", { project: true, cwd: isolated });
+  fs.chmodSync(result.file, 0o000);
+  assert.throws(
+    () => findActiveDuplicate("strict store original", { project: true, cwd: isolated }),
+  );
+  fs.chmodSync(result.file, 0o600);
+  assert.equal(findActiveDuplicate("strict store original", { project: true, cwd: isolated })?.id, result.id);
+
+  const dir = path.dirname(result.file);
+  const malformed = path.join(dir, "malformed.md");
+  fs.writeFileSync(malformed, "not frontmatter\n", { mode: 0o600 });
+  assert.throws(() => contextFacts({ cwd: isolated }), /malformed memory fact/);
+  fs.unlinkSync(malformed);
+
+  const target = path.join(os.tmpdir(), `recall-fact-target-${process.pid}.md`);
+  fs.writeFileSync(target, "foreign\n", { mode: 0o600 });
+  const link = path.join(dir, "linked.md");
+  fs.symlinkSync(target, link);
+  assert.throws(
+    () => findActiveDuplicate("strict store original", { project: true, cwd: isolated }),
+    /unsafe memory fact entry/,
+  );
+  fs.unlinkSync(link);
+  fs.unlinkSync(target);
 });

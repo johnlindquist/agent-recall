@@ -306,6 +306,34 @@ run_i "$h" --uninstall > /dev/null 2>&1; rc=$?
 check "uninstall with foreign save link exits 0" test "$rc" -eq 0
 check "uninstall preserves foreign save link" test "$(readlink "$h/.claude/skills/agent-recall-save")" = "$h/elsewhere"
 
+echo "# canonical tree no-follow preflight"
+h="$(new_home canonical-save-symlink)"; R="$h/recall root"
+mkdir -p "$R/integration" "$h/foreign-save"
+printf 'sentinel-save\n' > "$h/foreign-save/sentinel"
+ln -s "$h/foreign-save" "$R/integration/agent-recall-save"
+run_i "$h" > /dev/null 2>"$h/err"; rc=$?
+check "symlinked canonical save directory blocks install" test "$rc" -ne 0
+check "symlinked canonical save target sentinel preserved" grep -qx 'sentinel-save' "$h/foreign-save/sentinel"
+check "canonical save symlink rejected before wrapper mutation" test ! -e "$h/.local/bin/recall"
+
+h="$(new_home canonical-parent-symlink)"; R="$h/recall root"
+mkdir -p "$R" "$h/foreign-integration"
+printf 'sentinel-parent\n' > "$h/foreign-integration/sentinel"
+ln -s "$h/foreign-integration" "$R/integration"
+run_i "$h" > /dev/null 2>"$h/err"; rc=$?
+check "symlinked integration parent blocks install" test "$rc" -ne 0
+check "symlinked parent target sentinel preserved" grep -qx 'sentinel-parent' "$h/foreign-integration/sentinel"
+check "integration parent symlink rejected before wrapper mutation" test ! -e "$h/.local/bin/recall"
+
+h="$(new_home canonical-hardlink)"; R="$h/recall root"
+mkdir -p "$R/integration/agent-recall-save"
+printf 'sentinel-hardlink\n' > "$h/foreign-skill"
+ln "$h/foreign-skill" "$R/integration/agent-recall-save/SKILL.md"
+run_i "$h" > /dev/null 2>"$h/err"; rc=$?
+check "hard-linked canonical skill blocks install" test "$rc" -ne 0
+check "hard-linked foreign sentinel preserved" grep -qx 'sentinel-hardlink' "$h/foreign-skill"
+check "hard link rejected before wrapper mutation" test ! -e "$h/.local/bin/recall"
+
 echo "# codex AGENTS.override.md"
 h="$(new_home g)"
 printf '# override rules\n' > "$h/.codex/AGENTS.override.md"

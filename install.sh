@@ -117,6 +117,29 @@ AGENT_FILES=("$HOME/.claude/CLAUDE.md" "$HOME/.claude-second/CLAUDE.md" "$CODEX_
 ALL_AGENT_FILES=("${AGENT_FILES[@]}" "$CODEX_DIR/AGENTS.md" "$CODEX_DIR/AGENTS.override.md")
 SKILL_DIRS=("$HOME/.claude/skills" "$HOME/.claude-second/skills" "$HOME/.agents/skills" "$KIMI_DIR/skills")
 
+preflight_canonical_tree() {
+  local p links
+  for p in \
+    "$ROOT" "$ROOT/integration" \
+    "$ROOT/integration/agent-recall" \
+    "$ROOT/integration/agent-recall-save" \
+    "$ROOT/integration/agent-recall-save/agents"; do
+    if [ -L "$p" ]; then die "refusing symlinked canonical directory: $p"; fi
+    if [ -e "$p" ] && [ ! -d "$p" ]; then die "refusing non-directory canonical path: $p"; fi
+  done
+  for p in \
+    "$ROOT/integration/agent-recall/SKILL.md" \
+    "$ROOT/integration/agent-recall-save/SKILL.md" \
+    "$ROOT/integration/agent-recall-save/agents/openai.yaml"; do
+    if [ -L "$p" ]; then die "refusing symlinked canonical file: $p"; fi
+    if [ -e "$p" ] && [ ! -f "$p" ]; then die "refusing nonregular canonical file: $p"; fi
+    if [ -f "$p" ]; then
+      links="$(stat -f '%l' "$p" 2>/dev/null || stat -c '%h' "$p")"
+      if [ "$links" != "1" ]; then die "refusing hard-linked canonical file: $p"; fi
+    fi
+  done
+}
+
 # ---------- managed-block editing (validated, single-pass, atomic) ----------
 remove_block() { # $1=file — strip our block + trailing blank lines; exit 2 on unbalanced markers
   local f="$1" tmp
@@ -286,6 +309,7 @@ if [ "$UNINSTALL" = true ]; then do_uninstall; fi
 STAGE_NAME="preflight"
 echo "== agent-recall install =="
 if [ "$HUMAN_ONLY" = false ]; then preflight_all_skill_links; fi
+preflight_canonical_tree
 NODE_BIN="$(command -v node 2>/dev/null || true)"
 if [ -z "$NODE_BIN" ]; then
   die "node not found on PATH — install Node.js >= 22.5 (e.g. brew install node) or fix PATH"

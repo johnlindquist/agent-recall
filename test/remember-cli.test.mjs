@@ -110,7 +110,7 @@ function ttyForget(root, match, cwd = repo) {
 }
 
 const explicit = (text, scope = null) => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   mode: "explicit",
   text,
   scope,
@@ -296,7 +296,7 @@ test("proposal that expires while waiting for memory-write.lock writes nothing",
 test("duplicate items inside one proposal create only one fact", () => {
   const root = fresh("recall-cli-intra-proposal-");
   const receipt = stage(root, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     mode: "candidates",
     text: "Memory candidate (global): same batch fact\nMemory candidate (global): same batch fact",
     scopeOverride: null,
@@ -411,7 +411,7 @@ test("terminal review losslessly escapes hostile project and fact characters", (
   const stored = fs.readFileSync(path.join(root, "memory/projects", factFiles[0]), "utf8");
   assert.equal((stored.match(/^---$/gm) || []).length, 2);
   assert.match(stored, /^scope: project$/m);
-  assert.match(stored, /^project_key: [a-z0-9-]+-[a-f0-9]{10}$/m);
+  assert.match(stored, /^project_key: v2-[a-f0-9]{64}$/m);
   assert.ok(stored.endsWith(hostileFact + "\n"));
 
   const again = stage(root, explicit(hostileFact, "project"), project);
@@ -429,7 +429,7 @@ test("project acceptance is bound to the staged project and fails if it disappea
   const root = fresh("recall-cli-binding-");
   const project = fresh("recall-cli-bound-project-");
   const receipt = stage(root, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     mode: "candidates",
     text: "Memory candidate (project): bound project fact",
     scopeOverride: null,
@@ -443,7 +443,7 @@ test("project acceptance is bound to the staged project and fails if it disappea
 
   const doomed = fresh("recall-cli-doomed-project-");
   const doomedReceipt = stage(root, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     mode: "candidates",
     text: "Memory candidate (project): must not escape deleted project",
     scopeOverride: null,
@@ -492,13 +492,43 @@ test("project identity change while waiting for memory-write.lock fails closed",
   assert.ok(fs.existsSync(proposalFile));
 });
 
+test("removing Git identity after preview fails closed and trailing-space roots work", async () => {
+  const root = fresh("recall-cli-git-binding-");
+  const parent = fresh("recall-cli-git-parent-");
+  const project = path.join(parent, "repo ");
+  fs.mkdirSync(project);
+  assert.equal(spawnSync("git", ["init", "-q", project]).status, 0);
+  const receipt = stage(root, explicit("git identity bound fact", "project"), project);
+  const proposalFile = path.join(root, "state/memory-proposals", receipt.proposalId + ".json");
+  const release = holdMemoryWriteLock(root);
+  let moved = false;
+  const resultPromise = ttyRunAsync(root, receipt.proposalId, [
+    { expect: "Type SAVE", send: "SAVE" },
+  ], project, (chunk) => {
+    if (!moved && chunk.includes("Type SAVE")) {
+      moved = true;
+      fs.renameSync(path.join(project, ".git"), path.join(project, ".git-removed"));
+      release();
+    }
+  });
+  const result = await resultPromise;
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout + result.stderr, /proposal project identity has changed/);
+  assert.equal(fs.existsSync(path.join(root, "memory")), false);
+  assert.ok(fs.existsSync(proposalFile));
+
+  fs.renameSync(path.join(project, ".git-removed"), path.join(project, ".git"));
+  const retry = ttyRun(root, receipt.proposalId, [{ expect: "Type SAVE", send: "SAVE" }], project);
+  assert.equal(retry.status, 0, retry.stderr + retry.stdout);
+});
+
 test("mid-batch failure keeps the proposal and retry does not duplicate the first item", {
   skip: process.platform === "win32",
 }, () => {
   const root = fresh("recall-cli-partial-");
   const project = fresh("recall-cli-project-");
   const receipt = stage(root, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     mode: "candidates",
     text: "Memory candidate (project): partial project fact\nMemory candidate (global): partial global fact",
     scopeOverride: null,
@@ -540,4 +570,35 @@ test("forget is non-TTY blocked and real-TTY human retraction still works", () =
   assert.equal(retracted.status, 0, retracted.stderr + retracted.stdout);
   assert.match(retracted.stdout, /retracted id=/);
   assert.match(fs.readFileSync(file, "utf8"), /^status: retracted$/m);
+});
+
+test("post-write proposal cleanup failure reports applied success and retries safely", async () => {
+  const root = fresh("recall-cli-cleanup-deferred-");
+  const receipt = stage(root, explicit("cleanup deferred fact", "global"));
+  const proposalsDir = path.join(root, "state/memory-proposals");
+  const proposalFile = path.join(proposalsDir, receipt.proposalId + ".json");
+  const release = holdMemoryWriteLock(root);
+  let restricted = false;
+  const resultPromise = ttyRunAsync(root, receipt.proposalId, [
+    { expect: "Type SAVE", send: "SAVE" },
+  ], repo, (chunk) => {
+    if (!restricted && chunk.includes("Type SAVE")) {
+      restricted = true;
+      fs.chmodSync(proposalsDir, 0o500);
+      release();
+    }
+  });
+  const result = await resultPromise;
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /remembered scope="global"/);
+  assert.match(result.stdout + result.stderr, /memory applied; proposal cleanup deferred/);
+  assert.ok(fs.existsSync(proposalFile));
+  assert.equal(fs.readdirSync(path.join(root, "memory/global/facts")).length, 1);
+
+  fs.chmodSync(proposalsDir, 0o700);
+  const retry = ttyRun(root, receipt.proposalId, [{ expect: "Type SAVE", send: "SAVE" }]);
+  assert.equal(retry.status, 0, retry.stderr + retry.stdout);
+  assert.match(retry.stdout, /already active scope="global"/);
+  assert.equal(fs.existsSync(proposalFile), false);
+  assert.equal(fs.readdirSync(path.join(root, "memory/global/facts")).length, 1);
 });
