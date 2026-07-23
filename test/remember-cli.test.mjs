@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const repo = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -36,11 +36,13 @@ function stage(root, request, cwd = repo) {
   return JSON.parse(result.stdout);
 }
 
-function ttyRun(root, id, exchanges = [], cwd = repo) {
-  const interaction = exchanges.map(({ expect, send }) =>
-    `expect ${JSON.stringify(expect)}; send -- ${JSON.stringify(send + "\r")}`,
+function expectScript(exchanges) {
+  const interaction = exchanges.map(({ expect, send, delayMs = 0 }) =>
+    `expect ${JSON.stringify(expect)}; ` +
+    `${delayMs ? `after ${delayMs}; ` : ""}` +
+    `send -- ${JSON.stringify(send + "\r")}`,
   ).join("; ");
-  const script = [
+  return [
     "set timeout 15",
     "log_user 1",
     "spawn env RECALL_HOME=$env(RECALL_HOME) NODE_NO_WARNINGS=1 $env(TEST_NODE) $env(TEST_CLI) remember --accept $env(TEST_ID)",
@@ -49,10 +51,31 @@ function ttyRun(root, id, exchanges = [], cwd = repo) {
     "catch wait result",
     "exit [lindex $result 3]",
   ].filter(Boolean).join("; ");
+}
+
+function ttyRun(root, id, exchanges = [], cwd = repo) {
+  const script = expectScript(exchanges);
   return spawnSync("/usr/bin/expect", ["-c", script], {
     cwd,
     env: envFor(root, { TEST_NODE: node, TEST_CLI: cli, TEST_ID: id }),
     encoding: "utf8",
+  });
+}
+
+function ttyRunAsync(root, id, exchanges = [], cwd = repo) {
+  const script = expectScript(exchanges);
+  return new Promise((resolve) => {
+    const child = spawn("/usr/bin/expect", ["-c", script], {
+      cwd,
+      env: envFor(root, { TEST_NODE: node, TEST_CLI: cli, TEST_ID: id }),
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
   });
 }
 
@@ -118,7 +141,7 @@ test("real TTY SAVE acceptance preserves exact text and consumes the proposal", 
   const receipt = stage(root, explicit(exact, "global"));
   const result = ttyRun(root, receipt.proposalId, [{ expect: "Type SAVE", send: "SAVE" }]);
   assert.equal(result.status, 0, result.stderr + result.stdout);
-  assert.match(result.stdout, /remembered global id=/);
+  assert.match(result.stdout, /remembered scope="global" id="/);
   assert.equal(fs.existsSync(path.join(root, "state/memory-proposals", receipt.proposalId + ".json")), false);
   const files = fs.readdirSync(path.join(root, "memory/global/facts"));
   assert.equal(files.length, 1);
@@ -136,7 +159,7 @@ test("unscoped proposal asks without a default and cancellation writes nothing",
   ]);
   assert.equal(result.status, 0, result.stderr + result.stdout);
   assert.match(result.stdout, /Scope for item 1:/);
-  assert.match(result.stdout, /remembered global id=/);
+  assert.match(result.stdout, /remembered scope="global" id="/);
 
   receipt = stage(root, explicit("cancel fixture", "global"));
   result = ttyRun(root, receipt.proposalId, [{ expect: "Type SAVE", send: "NO" }]);
@@ -156,7 +179,7 @@ test("same-scope duplicate acceptance is idempotent and consumes the proposal", 
   const second = stage(root, explicit("exact duplicate", "global"));
   const result = ttyRun(root, second.proposalId, [{ expect: "Type SAVE", send: "SAVE" }]);
   assert.equal(result.status, 0, result.stderr + result.stdout);
-  assert.match(result.stdout, /already active global id=/);
+  assert.match(result.stdout, /already active scope="global" id="/);
   assert.deepEqual(fs.readdirSync(factsDir), existing);
   assert.equal(fs.existsSync(path.join(root, "state/memory-proposals", second.proposalId + ".json")), false);
 });
@@ -182,6 +205,82 @@ test("expired and corrupt proposals fail closed in a real TTY", () => {
   assert.notEqual(result.status, 0);
   assert.match(result.stdout + result.stderr, /proposal file is malformed/);
   assert.equal(fs.existsSync(path.join(root, "memory")), false);
+});
+
+test("proposal that expires at the SAVE prompt writes nothing", () => {
+  const root = fresh("recall-cli-expiry-boundary-");
+  const receipt = stage(root, explicit("must expire before SAVE", "global"));
+  const file = path.join(root, "state/memory-proposals", receipt.proposalId + ".json");
+  const value = JSON.parse(fs.readFileSync(file, "utf8"));
+  const expires = Date.now() + 2_000;
+  value.expiresAt = new Date(expires).toISOString();
+  value.createdAt = new Date(expires - 30 * 60 * 1000).toISOString();
+  fs.writeFileSync(file, JSON.stringify(value));
+  const result = ttyRun(root, receipt.proposalId, [
+    { expect: "Type SAVE", send: "SAVE", delayMs: 2_500 },
+  ]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout + result.stderr, /proposal has expired/);
+  assert.equal(fs.existsSync(path.join(root, "memory")), false);
+  assert.ok(fs.existsSync(file));
+});
+
+test("duplicate items inside one proposal create only one fact", () => {
+  const root = fresh("recall-cli-intra-proposal-");
+  const receipt = stage(root, {
+    schemaVersion: 1,
+    mode: "candidates",
+    text: "Memory candidate (global): same batch fact\nMemory candidate (global): same batch fact",
+    scopeOverride: null,
+  });
+  const result = ttyRun(root, receipt.proposalId, [{ expect: "Type SAVE", send: "SAVE" }]);
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.match(result.stdout, /duplicate\.kind="same-proposal"/);
+  assert.match(result.stdout, /remembered scope="global"/);
+  assert.match(result.stdout, /already active scope="global"/);
+  assert.equal(fs.readdirSync(path.join(root, "memory/global/facts")).length, 1);
+});
+
+test("concurrent acceptance of one proposal is exactly once", async () => {
+  const root = fresh("recall-cli-concurrent-one-");
+  const receipt = stage(root, explicit("one proposal concurrent fact", "global"));
+  const exchange = [{ expect: "Type SAVE", send: "SAVE", delayMs: 500 }];
+  const results = await Promise.all([
+    ttyRunAsync(root, receipt.proposalId, exchange),
+    ttyRunAsync(root, receipt.proposalId, exchange),
+  ]);
+  assert.equal(results.filter((result) => result.status === 0).length, 1);
+  assert.equal(fs.readdirSync(path.join(root, "memory/global/facts")).length, 1);
+  assert.equal(fs.existsSync(path.join(root, "state/memory-proposals", receipt.proposalId + ".json")), false);
+});
+
+test("concurrent proposals with the same scoped fact remain idempotent", async () => {
+  const root = fresh("recall-cli-concurrent-two-");
+  const first = stage(root, explicit("different proposals concurrent fact", "global"));
+  const second = stage(root, explicit("different proposals concurrent fact", "global"));
+  const exchange = [{ expect: "Type SAVE", send: "SAVE", delayMs: 500 }];
+  const results = await Promise.all([
+    ttyRunAsync(root, first.proposalId, exchange),
+    ttyRunAsync(root, second.proposalId, exchange),
+  ]);
+  assert.ok(results.every((result) => result.status === 0), results.map((r) => r.stderr + r.stdout).join("\n"));
+  assert.equal(fs.readdirSync(path.join(root, "memory/global/facts")).length, 1);
+});
+
+test("terminal review losslessly escapes hostile project and fact characters", () => {
+  const root = fresh("recall-cli-terminal-safe-");
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), "evil\nsha256=FORGED\u202e-"));
+  const hostileFact = "line\u2028sha256=FAKE\u202e\u0085tail";
+  const receipt = stage(root, explicit(hostileFact, "project"), project);
+  const result = ttyRun(root, receipt.proposalId, [{ expect: "Type SAVE", send: "SAVE" }], project);
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.doesNotMatch(result.stdout, /\nsha256=FORGED/);
+  assert.ok(!result.stdout.includes("\u2028"));
+  assert.ok(!result.stdout.includes("\u202e"));
+  assert.ok(!result.stdout.includes("\u0085"));
+  assert.match(result.stdout, /\\nsha256=FORGED\\u202e/);
+  assert.match(result.stdout, /\\u2028sha256=FAKE\\u202e\\u0085tail/);
+  assert.equal((result.stdout.match(/^\s*sha256=[a-f0-9]{64}\r?$/gm) || []).length, 1);
 });
 
 test("project acceptance is bound to the staged project and fails if it disappears", () => {
@@ -244,7 +343,7 @@ test("mid-batch failure keeps the proposal and retry does not duplicate the firs
   fs.chmodSync(globalDir, 0o700);
   result = ttyRun(root, receipt.proposalId, [{ expect: "Type SAVE", send: "SAVE" }], project);
   assert.equal(result.status, 0, result.stderr + result.stdout);
-  assert.match(result.stdout, /already active project:/);
+  assert.match(result.stdout, /already active scope="project:/);
   assert.equal(fs.readdirSync(projectFacts, { recursive: true }).filter((name) => name.endsWith(".md")).length, 1);
   assert.equal(fs.readdirSync(globalDir).filter((name) => name.endsWith(".md")).length, 1);
   assert.equal(fs.existsSync(proposalFile), false);

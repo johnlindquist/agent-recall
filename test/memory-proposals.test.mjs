@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 process.env.RECALL_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "recall-proposals-"));
 const {
@@ -19,6 +21,7 @@ const {
 const { MEMORY_PROPOSALS, MEMORY } = await import("../lib/paths.mjs");
 
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "recall-proposal-project-"));
+const cli = fileURLToPath(new URL("../bin/recall.mjs", import.meta.url));
 const candidateRequest = (text, scopeOverride = null) => ({
   schemaVersion: 1,
   mode: "candidates",
@@ -133,6 +136,31 @@ test("proposal IDs are random and the live proposal cap is enforced", () => {
     () => createMemoryProposal(parsed, { cwd, now: 1_800_000_000_000 }),
     /too many live memory proposals/,
   );
+});
+
+test("multiprocess proposal staging never exceeds the strict live cap", async () => {
+  const input = JSON.stringify(explicitRequest("concurrent cap fixture", "global"));
+  const stageOne = () => new Promise((resolve) => {
+    const child = spawn(process.execPath, [cli, "propose-memory", "--json"], {
+      cwd,
+      env: { ...process.env, RECALL_HOME: process.env.RECALL_HOME, NODE_NO_WARNINGS: "1" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(input);
+  });
+  const results = await Promise.all(Array.from({ length: 64 }, stageOne));
+  const files = fs.readdirSync(MEMORY_PROPOSALS).filter((name) => /^[a-f0-9]{32}\.json$/.test(name));
+  assert.equal(files.length, MAX_LIVE_PROPOSALS);
+  assert.equal(results.filter((result) => result.status === 0).length, MAX_LIVE_PROPOSALS);
+  assert.ok(results.filter((result) => result.status !== 0)
+    .every((result) => /too many live memory proposals/.test(result.stderr)));
 });
 
 test("expired proposals fail closed and are removed by bounded cleanup", () => {

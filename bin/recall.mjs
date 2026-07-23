@@ -456,6 +456,13 @@ function requireInteractiveRemember() {
   }
 }
 
+function terminalSafeJson(value) {
+  return JSON.stringify(String(value)).replace(
+    /[\u007f-\u009f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
+    (char) => `\\u${char.codePointAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
 function verifyProposalProject(project) {
   if (!project) return;
   let stat, top;
@@ -485,11 +492,13 @@ function cmdAcceptProposal(args) {
   for (const [index, item] of proposal.items.entries()) {
     let scope = item.scope;
     if (scope === null) {
-      const projectLabel = proposal.project
-        ? `project:${proposal.project.base} at ${proposal.project.top}`
-        : "project (unavailable)";
+      const projectDetails = proposal.project
+        ? `\n    project.top=${terminalSafeJson(proposal.project.top)}` +
+          `\n    project.base=${terminalSafeJson(proposal.project.base)}` +
+          `\n    project.dirKey=${terminalSafeJson(proposal.project.dirKey)}`
+        : " (unavailable)";
       const choice = readTerminalLine(
-        `Scope for item ${index + 1}:\n  p = ${projectLabel}\n  g = global\n  c = cancel\nChoice: `,
+        `Scope for item ${index + 1}:\n  p = project${projectDetails}\n  g = global\n  c = cancel\nChoice: `,
       );
       if (choice === "c") { console.log("cancelled; proposal kept"); return; }
       if (choice === "p" && proposal.project) scope = "project";
@@ -499,40 +508,78 @@ function cmdAcceptProposal(args) {
     const project = scope === "project";
     const cwd = proposal.project?.top || process.cwd();
     const duplicate = memory.findActiveDuplicate(item.fact, { project, cwd });
-    resolved.push({ ...item, scope, project, cwd, duplicate });
+    const pendingDuplicateOf = resolved.findIndex((prior) =>
+      prior.scope === scope && prior.fact === item.fact);
+    resolved.push({
+      ...item,
+      scope,
+      project,
+      cwd,
+      duplicate,
+      pendingDuplicateOf: pendingDuplicateOf >= 0 ? pendingDuplicateOf + 1 : null,
+    });
   }
 
   console.log("Memory proposal preview:");
   for (const [index, item] of resolved.entries()) {
-    const label = item.project ? `project:${proposal.project.base}` : "global";
-    console.log(`${index + 1}. scope=${label}`);
-    console.log(`   fact=${JSON.stringify(item.fact)}`);
+    console.log(`${index + 1}.`);
+    console.log(`   scope.kind=${terminalSafeJson(item.scope)}`);
+    if (item.project) {
+      console.log(`   project.top=${terminalSafeJson(proposal.project.top)}`);
+      console.log(`   project.base=${terminalSafeJson(proposal.project.base)}`);
+      console.log(`   project.dirKey=${terminalSafeJson(proposal.project.dirKey)}`);
+    }
+    console.log(`   fact=${terminalSafeJson(item.fact)}`);
     console.log(`   sha256=${item.sha256}`);
-    console.log(`   duplicate=${item.duplicate ? `active id=${item.duplicate.id}` : "none"}`);
+    if (item.duplicate) {
+      console.log("   duplicate.kind=\"active\"");
+      console.log(`   duplicate.scope=${terminalSafeJson(item.duplicate.scope)}`);
+      console.log(`   duplicate.id=${terminalSafeJson(item.duplicate.id)}`);
+    } else if (item.pendingDuplicateOf) {
+      console.log("   duplicate.kind=\"same-proposal\"");
+      console.log(`   duplicate.item=${item.pendingDuplicateOf}`);
+    } else {
+      console.log("   duplicate.kind=\"none\"");
+    }
   }
-  const newCount = resolved.filter((item) => !item.duplicate).length;
+  const newCount = resolved.filter((item) => !item.duplicate && !item.pendingDuplicateOf).length;
   const confirmation = readTerminalLine(
     `Type SAVE to persist ${newCount} new ${newCount === 1 ? "memory" : "memories"}: `,
   );
   if (confirmation !== "SAVE") { console.log("cancelled; nothing written and proposal kept"); return; }
 
-  const receipts = [];
-  for (const [index, item] of resolved.entries()) {
-    if (item.duplicate) {
-      receipts.push(`already active ${item.duplicate.scope} id=${item.duplicate.id}`);
-      continue;
+  return proposals.withProposalAcceptanceLock(args[1], () => {
+    // Revalidate at the write boundary: expiry, hashes, project binding, and
+    // the exact proposal that was previewed must all still hold after SAVE.
+    const fresh = proposals.loadMemoryProposal(args[1], { now: Date.now() });
+    if (JSON.stringify(fresh) !== JSON.stringify(proposal))
+      throw new Error("proposal changed after preview");
+    verifyProposalProject(fresh.project);
+
+    const receipts = [];
+    for (const [index, item] of resolved.entries()) {
+      const freshItem = fresh.items[index];
+      if (!freshItem || freshItem.fact !== item.fact || freshItem.sha256 !== item.sha256 ||
+          (freshItem.scope !== null && freshItem.scope !== item.scope))
+        throw new Error(`proposal item ${index + 1} changed after preview`);
+      try {
+        const result = memory.rememberIfAbsent(item.fact, {
+          project: item.project,
+          cwd: item.cwd,
+        });
+        if (result.action === "existing")
+          receipts.push(`already active scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
+        else
+          receipts.push(`remembered scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
+      } catch (error) {
+        for (const receipt of receipts) console.log(receipt);
+        console.error(`item ${index + 1} failed: ${error?.message || error}`);
+        throw new Error("proposal partially applied; proposal kept for an idempotent retry");
+      }
     }
-    try {
-      const result = memory.remember(item.fact, { project: item.project, cwd: item.cwd });
-      receipts.push(`remembered ${result.scope} id=${result.id}`);
-    } catch (error) {
-      for (const receipt of receipts) console.log(receipt);
-      console.error(`item ${index + 1} failed: ${error?.message || error}`);
-      throw new Error("proposal partially applied; proposal kept for an idempotent retry");
-    }
-  }
-  proposals.removeMemoryProposal(args[1]);
-  for (const receipt of receipts) console.log(receipt);
+    proposals.removeMemoryProposal(args[1]);
+    for (const receipt of receipts) console.log(receipt);
+  });
 }
 
 function parseLegacyRemember(args) {
