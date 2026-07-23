@@ -62,7 +62,7 @@ function ttyRun(root, id, exchanges = [], cwd = repo) {
   });
 }
 
-function ttyRunAsync(root, id, exchanges = [], cwd = repo) {
+function ttyRunAsync(root, id, exchanges = [], cwd = repo, onStdout = () => {}) {
   const script = expectScript(exchanges);
   return new Promise((resolve) => {
     const child = spawn("/usr/bin/expect", ["-c", script], {
@@ -73,10 +73,24 @@ function ttyRunAsync(root, id, exchanges = [], cwd = repo) {
     let stderr = "";
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      onStdout(chunk);
+    });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
   });
+}
+
+function holdMemoryWriteLock(root) {
+  const lock = path.join(root, "state/memory-write.lock");
+  fs.mkdirSync(lock, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({
+    pid: process.pid,
+    token: "test-owner",
+    startedAt: new Date().toISOString(),
+  }) + "\n", { mode: 0o600 });
+  return () => fs.rmSync(lock, { recursive: true, force: true });
 }
 
 const explicit = (text, scope = null) => ({
@@ -225,6 +239,28 @@ test("proposal that expires at the SAVE prompt writes nothing", () => {
   assert.ok(fs.existsSync(file));
 });
 
+test("proposal that expires while waiting for memory-write.lock writes nothing", async () => {
+  const root = fresh("recall-cli-expiry-lock-");
+  const receipt = stage(root, explicit("must expire behind write lock", "global"));
+  const file = path.join(root, "state/memory-proposals", receipt.proposalId + ".json");
+  const value = JSON.parse(fs.readFileSync(file, "utf8"));
+  const expires = Date.now() + 1_200;
+  value.expiresAt = new Date(expires).toISOString();
+  value.createdAt = new Date(expires - 30 * 60 * 1000).toISOString();
+  fs.writeFileSync(file, JSON.stringify(value));
+  const release = holdMemoryWriteLock(root);
+  const resultPromise = ttyRunAsync(root, receipt.proposalId, [
+    { expect: "Type SAVE", send: "SAVE" },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 1_800));
+  release();
+  const result = await resultPromise;
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout + result.stderr, /proposal has expired/);
+  assert.equal(fs.existsSync(path.join(root, "memory")), false);
+  assert.ok(fs.existsSync(file));
+});
+
 test("duplicate items inside one proposal create only one fact", () => {
   const root = fresh("recall-cli-intra-proposal-");
   const receipt = stage(root, {
@@ -269,8 +305,8 @@ test("concurrent proposals with the same scoped fact remain idempotent", async (
 
 test("terminal review losslessly escapes hostile project and fact characters", () => {
   const root = fresh("recall-cli-terminal-safe-");
-  const project = fs.mkdtempSync(path.join(os.tmpdir(), "evil\nsha256=FORGED\u202e-"));
-  const hostileFact = "line\u2028sha256=FAKE\u202e\u0085tail";
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), "evil\nsha256=FORGED\u202e\u061c-"));
+  const hostileFact = "line\u2028sha256=FAKE\u202e\u0085\u061ctail";
   const receipt = stage(root, explicit(hostileFact, "project"), project);
   const result = ttyRun(root, receipt.proposalId, [{ expect: "Type SAVE", send: "SAVE" }], project);
   assert.equal(result.status, 0, result.stderr + result.stdout);
@@ -278,8 +314,9 @@ test("terminal review losslessly escapes hostile project and fact characters", (
   assert.ok(!result.stdout.includes("\u2028"));
   assert.ok(!result.stdout.includes("\u202e"));
   assert.ok(!result.stdout.includes("\u0085"));
-  assert.match(result.stdout, /\\nsha256=FORGED\\u202e/);
-  assert.match(result.stdout, /\\u2028sha256=FAKE\\u202e\\u0085tail/);
+  assert.ok(!result.stdout.includes("\u061c"));
+  assert.match(result.stdout, /\\nsha256=FORGED\\u202e\\u061c/);
+  assert.match(result.stdout, /\\u2028sha256=FAKE\\u202e\\u0085\\u061ctail/);
   assert.equal((result.stdout.match(/^\s*sha256=[a-f0-9]{64}\r?$/gm) || []).length, 1);
 });
 
@@ -316,6 +353,38 @@ test("project acceptance is bound to the staged project and fails if it disappea
       .filter((name) => name.endsWith(".md")).length,
     1,
   );
+});
+
+test("project identity change while waiting for memory-write.lock fails closed", async () => {
+  const root = fresh("recall-cli-binding-lock-");
+  const parent = fresh("recall-cli-binding-parent-");
+  const project = path.join(parent, "child");
+  fs.mkdirSync(project);
+  const receipt = stage(root, explicit("must remain in reviewed project", "project"), project);
+  const proposalFile = path.join(root, "state/memory-proposals", receipt.proposalId + ".json");
+  const release = holdMemoryWriteLock(root);
+  let sawSavePrompt;
+  const savePrompt = new Promise((resolve) => { sawSavePrompt = resolve; });
+  const resultPromise = ttyRunAsync(root, receipt.proposalId, [
+    { expect: "Type SAVE", send: "SAVE" },
+  ], project, (chunk) => {
+    if (chunk.includes("Type SAVE")) sawSavePrompt();
+  });
+  await Promise.race([
+    savePrompt,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error("acceptance did not reach the SAVE prompt")),
+      10_000,
+    )),
+  ]);
+  const init = spawnSync("git", ["init", "-q", parent], { encoding: "utf8" });
+  assert.equal(init.status, 0, init.stderr);
+  release();
+  const result = await resultPromise;
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout + result.stderr, /proposal project identity has changed/);
+  assert.equal(fs.existsSync(path.join(root, "memory")), false);
+  assert.ok(fs.existsSync(proposalFile));
 });
 
 test("mid-batch failure keeps the proposal and retry does not duplicate the first item", {

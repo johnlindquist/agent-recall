@@ -458,7 +458,7 @@ function requireInteractiveRemember() {
 
 function terminalSafeJson(value) {
   return JSON.stringify(String(value)).replace(
-    /[\u007f-\u009f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
+    /[\u007f-\u009f\u2028\u2029]|\p{Bidi_Control}/gu,
     (char) => `\\u${char.codePointAt(0).toString(16).padStart(4, "0")}`,
   );
 }
@@ -479,6 +479,11 @@ function verifyProposalProject(project) {
   catch { throw new Error("proposal project identity cannot be verified"); }
   if (currentTop !== project.top || current.base !== project.base || current.dirKey !== project.dirKey)
     throw new Error("proposal project identity has changed");
+  return Object.freeze({
+    top: project.top,
+    base: project.base,
+    dirKey: project.dirKey,
+  });
 }
 
 function cmdAcceptProposal(args) {
@@ -548,38 +553,46 @@ function cmdAcceptProposal(args) {
   );
   if (confirmation !== "SAVE") { console.log("cancelled; nothing written and proposal kept"); return; }
 
-  return proposals.withProposalAcceptanceLock(args[1], () => {
-    // Revalidate at the write boundary: expiry, hashes, project binding, and
-    // the exact proposal that was previewed must all still hold after SAVE.
-    const fresh = proposals.loadMemoryProposal(args[1], { now: Date.now() });
-    if (JSON.stringify(fresh) !== JSON.stringify(proposal))
-      throw new Error("proposal changed after preview");
-    verifyProposalProject(fresh.project);
+  return proposals.withProposalAcceptanceLock(args[1], () =>
+    memory.withMemoryWriteLock(({ rememberIfAbsentAtTarget }) => {
+      // Lock order is proposal acceptance -> global memory write. Revalidate
+      // only after both are owned, then use one immutable project target for
+      // duplicate lookup and every write.
+      const fresh = proposals.loadMemoryProposal(args[1], { now: Date.now() });
+      if (JSON.stringify(fresh) !== JSON.stringify(proposal))
+        throw new Error("proposal changed after preview");
+      const projectTarget = verifyProposalProject(fresh.project);
+      // Project verification can run Git; perform one final immediate expiry
+      // check before any write while both locks remain held.
+      const writeSnapshot = proposals.loadMemoryProposal(args[1], { now: Date.now() });
+      if (JSON.stringify(writeSnapshot) !== JSON.stringify(fresh))
+        throw new Error("proposal changed at write boundary");
 
-    const receipts = [];
-    for (const [index, item] of resolved.entries()) {
-      const freshItem = fresh.items[index];
-      if (!freshItem || freshItem.fact !== item.fact || freshItem.sha256 !== item.sha256 ||
-          (freshItem.scope !== null && freshItem.scope !== item.scope))
-        throw new Error(`proposal item ${index + 1} changed after preview`);
-      try {
-        const result = memory.rememberIfAbsent(item.fact, {
-          project: item.project,
-          cwd: item.cwd,
-        });
-        if (result.action === "existing")
-          receipts.push(`already active scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
-        else
-          receipts.push(`remembered scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
-      } catch (error) {
-        for (const receipt of receipts) console.log(receipt);
-        console.error(`item ${index + 1} failed: ${error?.message || error}`);
-        throw new Error("proposal partially applied; proposal kept for an idempotent retry");
+      const receipts = [];
+      for (const [index, item] of resolved.entries()) {
+        const freshItem = writeSnapshot.items[index];
+        if (!freshItem || freshItem.fact !== item.fact || freshItem.sha256 !== item.sha256 ||
+            (freshItem.scope !== null && freshItem.scope !== item.scope))
+          throw new Error(`proposal item ${index + 1} changed after preview`);
+        try {
+          const result = rememberIfAbsentAtTarget(
+            item.fact,
+            item.project ? projectTarget : null,
+          );
+          if (result.action === "existing")
+            receipts.push(`already active scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
+          else
+            receipts.push(`remembered scope=${terminalSafeJson(result.scope)} id=${terminalSafeJson(result.id)}`);
+        } catch (error) {
+          for (const receipt of receipts) console.log(receipt);
+          console.error(`item ${index + 1} failed: ${error?.message || error}`);
+          throw new Error("proposal partially applied; proposal kept for an idempotent retry");
+        }
       }
-    }
-    proposals.removeMemoryProposal(args[1]);
-    for (const receipt of receipts) console.log(receipt);
-  });
+      proposals.removeMemoryProposal(args[1]);
+      for (const receipt of receipts) console.log(receipt);
+    }),
+  );
 }
 
 function parseLegacyRemember(args) {
