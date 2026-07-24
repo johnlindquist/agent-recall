@@ -22,8 +22,7 @@ building it — the discipline is: no trigger, no build.
 
 | Item | Build when |
 | --- | --- |
-| Antigravity parsing tier (index the snapshot DBs; schema-discovery + protobuf walker designed) | First real search miss for content known to be in an agy session |
-| Gemini CLI chats connector (`~/.gemini/tmp/<hash>/chats`); Antigravity IDE workspaceStorage | Either becomes a daily-driver source |
+| Gemini CLI chats connector (`~/.gemini/tmp/<hash>/chats`) | Becomes a daily-driver source |
 | Embeddings (hybrid rerank over BM25, local model only) | Two misses in 30 days where a paraphrase would have matched but reasonable lexical variants didn't; must also pass: paraphrase Recall@5 +20pts, p95 ≤500ms, index ≤2× lexical, purge drill passes |
 | Session-end retro / proposal automation | Manually saving ≥10 facts/month AND still losing ≥3 consequential facts/month |
 | MCP server (stdio wrapper over the same CLI, never a listener) | Adopting an agent that cannot shell out but speaks MCP; plus 30 days of stable skill-based use |

@@ -29,13 +29,13 @@ const touchIndex = () => setMeta("lastIndex", new Date().toISOString());
 const setStats = (o) => setMeta("lastIndexStats", JSON.stringify(o));
 
 const entry = (rel) => ({ rel, gens: ["g0001.jsonl"], size: 1, mtimeMs: 1, ino: 1, tail: "" });
-function writeManifest({ ghost = true, at = new Date().toISOString(), storageSkipped = 0, agy = 0 } = {}) {
+function writeManifest({ ghost = true, at = new Date().toISOString(), storageSkipped = 0 } = {}) {
   const entries = { "srcA proj1/a.jsonl": entry("proj1/a.jsonl") };
   if (ghost) for (let i = 0; i < 60; i++) entries[`ghost f${i}.jsonl`] = entry(`f${i}.jsonl`);
   fs.mkdirSync(STATE, { recursive: true });
   fs.writeFileSync(MANIFEST, JSON.stringify({
     entries,
-    lastRun: { at, seconds: 1, counts: { copied: 0, errors: 0, storageSkipped }, monitor: { agy } },
+    lastRun: { at, seconds: 1, counts: { copied: 0, errors: 0, storageSkipped } },
   }));
 }
 
@@ -99,14 +99,13 @@ test("stale archive (>24h) degrades status with a gap", () => {
   assert.match(banner(cov), /DEGRADED/);
 });
 
-test("run-local parseErrors, storageSkipped, and agy monitor produce gap lines only", () => {
-  writeManifest({ ghost: false, storageSkipped: 4, agy: 2 });
+test("run-local parseErrors and storageSkipped produce gap lines only", () => {
+  writeManifest({ ghost: false, storageSkipped: 4 });
   touchIndex();
   setStats({ parseErrors: 5 });
   const cov = coverage(db);
   assert.ok(cov.gaps.some((g) => g.includes("5 unparsed lines")), JSON.stringify(cov.gaps));
   assert.ok(cov.gaps.some((g) => g.includes("4 files skipped")), JSON.stringify(cov.gaps));
-  assert.ok(cov.gaps.some((g) => g.includes("antigravity: 2")), JSON.stringify(cov.gaps));
   // run-local counters alone don't degrade; PERSISTENT gaps do (tested below)
   assert.equal(cov.status, "ok");
 });

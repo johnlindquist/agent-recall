@@ -22,7 +22,6 @@ const { dbOpen, indexAll, needsRebuild, rebuild } = dbmod;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ARCHIVER = fs.existsSync(path.join(BIN, "archive.mjs")) ? path.join(BIN, "archive.mjs") : path.join(HERE, "archive.mjs");
-const AGY_FLAG = path.join(STATE, "agy-enabled");
 const SYNC_LOCK = path.join(STATE, "sync.lock");
 
 const USAGE = `agent-recall — local cross-agent history search + shared memory
@@ -36,7 +35,6 @@ usage:
   recall context [--json]             curated facts (agents: read-only)
   recall forget "<text or id>"        retract a fact (file preserved)
   recall doctor                       health + per-source coverage
-  recall agy-enable                   enable Antigravity snapshot lane (gated)
   recall index [--rebuild] | archive | self-test`;
 
 class UsageError extends Error {}
@@ -166,12 +164,6 @@ async function cmdSync(args) {
   const s = await indexToCompletion(db, quiet);
   if (s.skipped) { console.error("busy (index is locked by another process)"); process.exit(75); }
 
-  if (fs.existsSync(AGY_FLAG)) {
-    const { snapshotAll } = await import("../lib/agy.mjs");
-    const rep = await snapshotAll({});
-    if (!quiet && (rep.snapshotted || rep.errors)) console.log(`agy: ${rep.snapshotted} snapshotted, ${rep.deduped} deduped, ${rep.skippedBusy} busy, ${rep.errors} errors`);
-  }
-
   const complete = !s.budgetHit;
   const archiveOk = outcome === undefined || outcome === "ok";
   if (!quiet) {
@@ -198,7 +190,7 @@ function ftsExpr(q) {
 // B16: real argument parser — `--` terminator, valued --source, unknown
 // options are errors (exit 64), query terms may start with `-` after `--`.
 function parseSearchArgs(args) {
-  const known = new Set([...Object.keys(SOURCES), "selftest", "agy"]);
+  const known = new Set([...Object.keys(SOURCES), "selftest"]);
   const opts = { json: false, all: false, raw: false, includeUnscoped: false, source: null };
   const terms = [];
   let terminated = false;
@@ -793,7 +785,6 @@ function cmdDoctor() {
     const r = spawnSync("launchctl", ["print", `gui/${process.getuid()}/local.agent-recall.sync`], { encoding: "utf8" });
     add(childExitCode(r) === 0 ? "ok" : "fail", "launchd job");
   } catch { add("fail", "launchd job"); }
-  add(fs.existsSync(AGY_FLAG) ? "ok" : "warn", "agy lane", fs.existsSync(AGY_FLAG) ? "enabled" : `disabled — run: recall agy-enable (${m?.lastRun?.monitor?.agy ?? "?"} conversations waiting)`);
 
   let fail = false;
   for (const c of checks) {
@@ -802,19 +793,6 @@ function cmdDoctor() {
     console.log(`${tag} ${c.name}${c.note ? ` — ${c.note}` : ""}`);
   }
   process.exit(fail ? 1 : 0);
-}
-
-async function cmdAgyEnable() {
-  const { walCanary, snapshotAll } = await import("../lib/agy.mjs");
-  console.log("running WAL canary (gate item 1)…");
-  const c = await walCanary();
-  if (!c.pass) { console.error("WAL canary FAILED — lane stays disabled:"); for (const d of c.details) console.error("  " + d); process.exit(1); }
-  console.log("canary pass. Running first snapshot pass (bounded)…");
-  const rep = await snapshotAll({});
-  console.log(`agy: ${rep.snapshotted} snapshotted, ${rep.deduped} deduped, ${rep.skippedBusy} busy, ${rep.errors} errors, ${(rep.bytes / 1048576).toFixed(0)}MiB`);
-  if (rep.errors > rep.snapshotted) { console.error("too many errors — lane stays disabled"); process.exit(1); }
-  fs.writeFileSync(AGY_FLAG, new Date().toISOString() + "\n", { mode: 0o600 });
-  console.log("agy lane ENABLED — snapshots run on every sync. Note: agy DBs are archived but not yet parsed into the index (raw lane: rg over archive/agy after schema work).");
 }
 
 async function cmdSelfTest() {
@@ -968,7 +946,6 @@ const run = {
   context: () => cmdContext(args),
   forget: () => cmdForget(args),
   doctor: () => cmdDoctor(),
-  "agy-enable": () => cmdAgyEnable(),
   "self-test": () => cmdSelfTest(),
 }[cmd];
 

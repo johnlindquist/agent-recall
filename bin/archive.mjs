@@ -60,9 +60,6 @@ const SOURCES = process.env.RECALL_ONLY_SELFTEST
       ["kimi-legacy", path.join(HOME, ".kimi/sessions")],
       ["pi", path.join(HOME, ".pi/agent/sessions")],
     ];
-// Monitored but NOT archived yet (SQLite snapshot lane not enabled; see doctor).
-const MONITOR_ONLY = [["agy", path.join(HOME, ".gemini/antigravity-cli/conversations")]];
-
 const t0 = Date.now();
 const deadline = () => (Date.now() - t0) / 1000 > MAX_SECONDS;
 const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
@@ -349,30 +346,6 @@ function resolveEntryDir(m, id, rel, source) {
   die(`relpath collision unresolvable for ${id}`);
 }
 
-// Bounded monitor-only probe; failures are explicit, never silent (A15).
-function probeMonitors() {
-  const monitor = {}, monitorErrors = {};
-  for (const [name, dir] of MONITOR_ONLY) {
-    if (deadline()) { monitor[name] = null; monitorErrors[name] = "deferred-deadline"; continue; }
-    try {
-      let n = 0;
-      const d = fs.opendirSync(dir);
-      try {
-        let ent;
-        while ((ent = d.readSync()) !== null) {
-          if (ent.name.endsWith(".db")) n++;
-          if (deadline()) { monitorErrors[name] = "partial-deadline"; break; }
-        }
-      } finally { d.closeSync(); }
-      monitor[name] = n;
-    } catch (err) {
-      if (err.code === "ENOENT") monitor[name] = 0;
-      else { monitor[name] = null; monitorErrors[name] = String(err.code || err.message); log(`monitor ${name} error ${err.code || err.message}`); }
-    }
-  }
-  return { monitor, monitorErrors };
-}
-
 function run() {
   const m = loadManifest();
   const counts = {
@@ -525,11 +498,10 @@ function run() {
     if (processItem(it) === "deadline") { counts.deadlineHit++; m.cursor = { source: it.source, rel: it.rel }; break; }
   }
 
-  const { monitor, monitorErrors } = probeMonitors();
   const outcome = counts.errors || counts.walkErrors || counts.recoveryErrors ? "error"
     : counts.deadlineHit || counts.fileLimitHit || counts.archiveLimitSkipped ? "incomplete" : "ok";
   m.archiveBytes = archBytes;
-  m.lastRun = { at: new Date().toISOString(), seconds: (Date.now() - t0) / 1000, counts, monitor, monitorErrors, outcome, archiveBytes: archBytes };
+  m.lastRun = { at: new Date().toISOString(), seconds: (Date.now() - t0) / 1000, counts, outcome, archiveBytes: archBytes };
   m.runs = [...(m.runs || []), m.lastRun].slice(-30);
   saveManifest(m); // durable before the dirty marker clears (A3, A10)
   if (dirtySet && counts.recoveryErrors === 0) { fs.rmSync(DIRTY, { force: true }); fsyncDir(STATE); }

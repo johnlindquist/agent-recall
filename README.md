@@ -35,7 +35,6 @@ known — the exact command to reopen that session.
 | Grok CLI | `~/.grok/sessions` | append-preserving; structured JSONL indexed, diagnostic/terminal `.log` artifacts raw-only |
 | Kimi CLI | `~/.kimi-code/sessions` (+ legacy `~/.kimi/sessions`) | append-preserving; `wire.jsonl` indexed (session-from-path), `kimi-code.log`/`output.log` raw-only |
 | pi | `~/.pi/agent/sessions` | append-preserving JSONL |
-| Google Antigravity | `~/.gemini/antigravity-cli/conversations` | **gated SQLite snapshot lane** — enable with `recall agy-enable` (WAL-safe online backup; archived, searchable via `--raw`; not yet parsed into the index) |
 
 ## Install
 
@@ -71,7 +70,6 @@ recall remember "<fact>" [--project|--global] [--]  # direct human-only path
 recall context                   curated facts (read-only for agents; stale facts flagged)
 recall forget "<text or id>"     direct human-only retraction (file preserved)
 recall doctor                    health + per-source coverage + integrity checks
-recall agy-enable                enable the Antigravity snapshot lane (runs a WAL canary gate first)
 recall index [--rebuild] | archive | self-test
 ```
 
@@ -276,16 +274,6 @@ role-blind injection performs worst,
 and semantic search only when real usage shows paraphrase queries failing
 lexical ones — a measured gate, not a fashion choice. The disposable index
 makes reversing this decision a version bump, not a migration.
-
-### Antigravity gets its own gated lane
-
-Antigravity stores one *live* SQLite database per conversation with WAL
-sidecars. Naively copying `.db` files loses committed transactions sitting
-in the WAL and risks corrupt snapshots, so this lane uses the SQLite Online
-Backup API from a read-only connection, integrity-checks the snapshot (never
-the source), content-hash dedupes generations — and ships disabled until a
-synthetic WAL canary proves all of that on your machine (`recall
-agy-enable`).
 
 ## Regression verification
 
